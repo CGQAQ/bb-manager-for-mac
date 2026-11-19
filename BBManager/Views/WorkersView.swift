@@ -64,7 +64,7 @@ struct WorkersView: View {
                 name: machine?.displayName ?? "Unknown",
                 host: machine?.host ?? "",
                 health: model.health(role),
-                kind: worker.settings.kind == .fuse ? "FUSE" : "Hardlinking",
+                kind: worker.settings.kind.shortLabel,
                 concurrency: worker.settings.concurrency,
                 actions: Format.number(model.workerSummary(worker.id)?.actionsExecuted),
                 cpu: Format.percent(sample?.cpuUsage),

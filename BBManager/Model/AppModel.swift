@@ -278,11 +278,24 @@ final class AppModel {
         guard let machine = machine(id) else { return }
         connectivity[id] = .checking
         do {
-            let facts = try await inspect(machine)
+            var facts = try await inspect(machine)
             if let index = machines.firstIndex(where: { $0.id == id }) {
                 machines[index].facts = facts
+                // Macs run native workers as the SSH user: no sudo, no Docker, home directory.
+                if facts.isMacOS, !roles(on: id).contains(where: { deployedAt($0) != nil }) {
+                    var native = machines[index]
+                    native.adoptNativeMode()
+                    if native.privilege != machine.privilege || native.installDirectory != machine.installDirectory {
+                        machines[index] = native
+                        if let again = try? await inspect(native) {
+                            facts = again
+                            machines[index].facts = again
+                        }
+                    }
+                }
             }
-            connectivity[id] = facts.privilegeError.map { .limited($0) } ?? .online
+            // Docker isn't used on Macs, so a failing privileged Docker check doesn't limit them.
+            connectivity[id] = facts.isMacOS ? .online : (facts.privilegeError.map { .limited($0) } ?? .online)
         } catch {
             connectivity[id] = Connectivity.from(error)
         }
@@ -361,7 +374,7 @@ final class AppModel {
         runOperation(
             title: "\(verb) \(title(for: role))",
             machine: plan.machine,
-            script: RemoteScripts.deploy(plan, pullImages: pullImages)
+            script: RemoteScripts.install(plan, pullImages: pullImages)
         ) { [weak self] in
             self?.markDeployed(role, fingerprint: fingerprint)
         }
@@ -380,7 +393,7 @@ final class AppModel {
                 guard !Task.isCancelled else { break }
                 session.log.append("\n━━━ \(self.title(for: role)) on \(plan.machine.displayName) ━━━\n")
                 do {
-                    for try await chunk in self.ssh.stream(plan.machine, script: RemoteScripts.deploy(plan, pullImages: true), privileged: true) {
+                    for try await chunk in self.ssh.stream(plan.machine, script: RemoteScripts.install(plan, pullImages: true), privileged: true) {
                         session.log.append(chunk)
                     }
                     // A cancelled stream ends without throwing; never record that as deployed.
@@ -417,7 +430,7 @@ final class AppModel {
 
     func updateImages(_ role: NodeRole) {
         guard let plan = plan(role) else { return }
-        runOperation(title: "Update \(title(for: role))", machine: plan.machine, script: RemoteScripts.deploy(plan, pullImages: true)) { [weak self] in
+        runOperation(title: "Update \(title(for: role))", machine: plan.machine, script: RemoteScripts.install(plan, pullImages: true)) { [weak self] in
             self?.markDeployed(role, fingerprint: plan.fingerprint)
         }
     }
@@ -429,7 +442,7 @@ final class AppModel {
         Task {
             defer { busyNodes.remove(role) }
             do {
-                try await ssh.runChecked(plan.machine, script: RemoteScripts.compose(action, directory: plan.directory, service: service), privileged: true, timeout: 300)
+                try await ssh.runChecked(plan.machine, script: RemoteScripts.control(action, plan: plan, service: service), privileged: true, timeout: 300)
             } catch {
                 alert = AlertItem(title: "\(action.title) Failed", message: error.localizedDescription)
             }
@@ -445,7 +458,7 @@ final class AppModel {
         runOperation(
             title: "Remove \(title(for: role))",
             machine: plan.machine,
-            script: RemoteScripts.uninstall(directory: plan.directory, removeData: deleteData)
+            script: RemoteScripts.remove(plan, removeData: deleteData)
         ) { [weak self] in
             self?.forgetNode(role)
         }
@@ -541,7 +554,7 @@ final class AppModel {
                     try await run(TakeoverSurvey.stopScript(takeover))
                     for (role, nodePlan) in plans {
                         session.log.append("\n━━━ Deploying \(title(for: role)) ━━━\n")
-                        try await run(RemoteScripts.deploy(nodePlan, pullImages: true))
+                        try await run(RemoteScripts.install(nodePlan, pullImages: true))
                         markDeployed(role, fingerprint: nodePlan.fingerprint)
                     }
                 } catch {
@@ -652,7 +665,7 @@ final class AppModel {
     private func pollNodes(on machine: Machine) -> [(NodeRole, RemoteScripts.PollNode)] {
         roles(on: machine.id).compactMap { role in
             guard let plan = plan(role) else { return nil }
-            return (role, RemoteScripts.PollNode(key: role.directoryName, directory: plan.directory, diagnostics: plan.diagnostics))
+            return (role, RemoteScripts.PollNode(key: role.directoryName, directory: plan.directory, diagnostics: plan.diagnostics, runtime: plan.runtime))
         }
     }
 

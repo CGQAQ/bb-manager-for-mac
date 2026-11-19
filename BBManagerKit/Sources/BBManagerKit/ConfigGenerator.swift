@@ -20,6 +20,21 @@ public struct DiagnosticsEndpoint: Hashable, Sendable {
     public var port: Int
 }
 
+/// How a node's services are run on its machine.
+public enum NodeRuntime: String, Sendable {
+    /// A Docker Compose project.
+    case compose
+    /// launchd agents running Buildbarn binaries directly (macOS).
+    case launchd
+}
+
+/// Buildbarn release whose binaries a native node downloads.
+public struct NativeRelease: Hashable, Sendable {
+    /// GitHub release tag of buildbarn/bb-remote-execution, e.g. `20261102T094740Z-c9ba98c`.
+    public var tag: String
+    public var binaries: [String]
+}
+
 /// Everything needed to deploy one node (main or worker) to a machine.
 public struct NodePlan: Sendable {
     public var role: NodeRole
@@ -35,6 +50,8 @@ public struct NodePlan: Sendable {
     public var stopBeforeDeploy: Bool
     /// Host ports the node publishes, on any address.
     public var hostPorts: [Int] = []
+    public var runtime: NodeRuntime = .compose
+    public var nativeRelease: NativeRelease?
 
     /// Stable hash of the effective file contents, used to detect undeployed changes.
     public var fingerprint: String {
@@ -255,7 +272,7 @@ public struct ConfigGenerator {
         "http://\(main.advertisedAddress):\(main.portal.httpPort)/browser"
     }
 
-    func common(_ main: MainNodeSettings) -> String {
+    func common(_ main: MainNodeSettings, diagnosticsAddress: String = ":9980") -> String {
         """
         // \(Self.header)
         {
@@ -264,7 +281,7 @@ public struct ConfigGenerator {
           global: {
             diagnosticsHttpServer: {
               httpServers: [{
-                listenAddresses: [':9980'],
+                listenAddresses: [\(js(diagnosticsAddress))],
                 authenticationPolicy: { allow: {} },
               }],
               enablePrometheus: true,
@@ -621,6 +638,9 @@ public struct ConfigGenerator {
 
     public func workerPlan(_ worker: WorkerNode) -> NodePlan? {
         guard let main = cluster.main, let machine = machine(worker.machineID) else { return nil }
+        if worker.settings.kind == .native {
+            return nativeWorkerPlan(worker, main: main, machine: machine)
+        }
         let shards = max(1, main.storage.shards)
         let externalStorage = (0..<shards).map { "\(main.advertisedAddress):\(main.storageBasePort + $0)" }
         let settings = worker.settings
@@ -880,6 +900,170 @@ public struct ConfigGenerator {
             cacheReplacementPolicy: 'LEAST_RECENTLY_USED',
           },
         }
+
+        """
+    }
+
+    // MARK: - Native macOS worker
+
+    /// Release tag of the worker image, e.g. `ghcr.io/buildbarn/bb-worker:20261102T094740Z-c9ba98c`
+    /// → `20261102T094740Z-c9ba98c`. Buildbarn tags images and GitHub releases alike.
+    public var workerReleaseTag: String? {
+        let image = cluster.images.worker.components(separatedBy: "@").first ?? cluster.images.worker
+        guard let colon = image.lastIndex(of: ":"), !image[image.index(after: colon)...].contains("/") else { return nil }
+        let tag = String(image[image.index(after: colon)...])
+        return tag.isEmpty || tag == "latest" ? nil : tag
+    }
+
+    func nativeWorkerPlan(_ worker: WorkerNode, main: MainNodeSettings, machine: Machine) -> NodePlan {
+        let s = worker.settings
+        let directory = Self.directory(for: .worker(worker.id), on: machine)
+        let shards = max(1, main.storage.shards)
+        let externalStorage = (0..<shards).map { "\(main.advertisedAddress):\(main.storageBasePort + $0)" }
+        let files: [(String, String)] = [
+            ("config/common.libsonnet", common(main, diagnosticsAddress: "127.0.0.1:\(Self.workerDiagnosticsPort)")),
+            ("config/topology.libsonnet", topology(storageAddresses: externalStorage)),
+            ("config/worker.jsonnet", nativeWorker(s, main: main, machine: machine, directory: directory)),
+            ("config/runner.jsonnet", nativeRunner(directory: directory)),
+            ("launchd/\(LaunchdScripts.label("runner")).plist", launchAgent(service: "runner", binary: "bb_runner", directory: directory)),
+            ("launchd/\(LaunchdScripts.label("worker")).plist", launchAgent(service: "worker", binary: "bb_worker", directory: directory)),
+        ]
+        let layout = Self.shortHash("native|\(s.localCacheSizeGiB)|\(s.maximumCacheFileCount)")
+        let prepare = """
+        LAYOUT='\(layout)'
+        if [ "$(cat .cache-layout 2>/dev/null)" != "$LAYOUT" ]; then
+          rm -rf cache
+        fi
+        rm -rf build runner.sock
+        mkdir -p build cache logs
+        chmod 0700 cache
+        printf '%s' "$LAYOUT" > .cache-layout
+
+        """
+        return NodePlan(
+            role: .worker(worker.id),
+            machine: machine,
+            directory: directory,
+            files: files.map { GeneratedFile(path: $0.0, generated: $0.1, override: worker.fileOverrides[$0.0]) },
+            prepareScript: prepare,
+            services: LaunchdScripts.services,
+            diagnostics: [DiagnosticsEndpoint(service: "worker", port: Self.workerDiagnosticsPort)],
+            stopBeforeDeploy: true,
+            hostPorts: [Self.workerDiagnosticsPort],
+            runtime: .launchd,
+            nativeRelease: NativeRelease(tag: workerReleaseTag ?? "", binaries: ["bb_worker", "bb_runner"])
+        )
+    }
+
+    func nativeWorker(_ s: WorkerSettings, main: MainNodeSettings, machine: Machine, directory: String) -> String {
+        let cacheBytes = Self.bytes(gib: max(0.25, s.localCacheSizeGiB))
+        return """
+        // \(Self.header)
+        local common = import 'common.libsonnet';
+        local topology = import 'topology.libsonnet';
+
+        {
+          blobstore: {
+            actionCache: topology.actionCache,
+            contentAddressableStorage: {
+              chunkStorage: topology.chunkStorage,
+              chunkMappingStorage: topology.chunkMappingStorage,
+              cdcParameterCache: topology.cdcParameterCache,
+            },
+          },
+          portalUrl: common.portalUrl,
+          maximumMessageSizeBytes: common.maximumMessageSizeBytes,
+          scheduler: { address: \(js("\(main.advertisedAddress):\(main.schedulerWorkerPort)")) },
+          global: common.global,
+          buildDirectories: [{
+            native: {
+              buildDirectoryPath: \(js(directory + "/build")),
+              cacheDirectoryPath: \(js(directory + "/cache")),
+              maximumCacheFileCount: \(max(100, s.maximumCacheFileCount)),
+              maximumCacheSizeBytes: \(Self.sizeExpression(cacheBytes)),
+              cacheReplacementPolicy: 'LEAST_RECENTLY_USED',
+            },
+            runners: [{
+              // Relative to the working directory both launchd agents share; macOS caps
+              // Unix socket paths at 104 bytes, which long install paths would exceed.
+              endpoint: { address: 'unix:runner.sock' },
+              concurrency: \(max(1, s.concurrency)),
+              instanceNamePrefix: \(js(s.instanceNamePrefix)),
+        \(Self.indent(platformBlock(s), 6, includeFirstLine: true))
+        \(Self.indent(workerID(machine), 6, includeFirstLine: true))
+            }],
+          }],
+          inputDownloadConcurrency: \(max(1, s.inputDownloadConcurrency)),
+          outputUploadConcurrency: \(max(1, s.outputUploadConcurrency)),
+          directoryCache: {
+            maximumCount: 1000,
+            maximumSizeBytes: 1000 * 1024,
+            cacheReplacementPolicy: 'LEAST_RECENTLY_USED',
+          },
+        }
+
+        """
+    }
+
+    func nativeRunner(directory: String) -> String {
+        """
+        // \(Self.header)
+        {
+          buildDirectoryPath: \(js(directory + "/build")),
+          grpcServers: [{
+            listenPaths: ['runner.sock'],
+            authenticationPolicy: { allow: {} },
+          }],
+        }
+
+        """
+    }
+
+    func launchAgent(service: String, binary: String, directory: String) -> String {
+        func xml(_ value: String) -> String {
+            value.replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+        }
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <!-- \(Self.header) -->
+        <plist version="1.0">
+        <dict>
+          <key>Label</key>
+          <string>\(LaunchdScripts.label(service))</string>
+          <key>ProgramArguments</key>
+          <array>
+            <string>\(xml(directory))/bin/\(binary)</string>
+            <string>\(xml(directory))/config/\(service).jsonnet</string>
+          </array>
+          <key>WorkingDirectory</key>
+          <string>\(xml(directory))</string>
+          <key>RunAtLoad</key>
+          <true/>
+          <key>KeepAlive</key>
+          <true/>
+          <key>ThrottleInterval</key>
+          <integer>10</integer>
+          <key>ProcessType</key>
+          <string>Standard</string>
+          <key>SoftResourceLimits</key>
+          <dict>
+            <key>NumberOfFiles</key>
+            <integer>65536</integer>
+          </dict>
+          <key>EnvironmentVariables</key>
+          <dict>
+            <key>PATH</key>
+            <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
+          </dict>
+          <key>StandardOutPath</key>
+          <string>\(xml(directory))/logs/\(service).log</string>
+          <key>StandardErrorPath</key>
+          <string>\(xml(directory))/logs/\(service).log</string>
+        </dict>
+        </plist>
 
         """
     }

@@ -13,13 +13,20 @@ public enum RemoteScripts {
     /// Collects machine facts without elevated privileges. Prints `key=value` lines.
     public static func preflight(installDirectory: String) -> String {
         """
-        echo "os=$( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -s)"
+        echo "kernel_name=$(uname -s)"
+        if [ "$(uname -s)" = Darwin ]; then
+          echo "os=macOS $(sw_vers -productVersion 2>/dev/null)"
+          echo "mem_kb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 ))"
+          echo "ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)"
+        else
+          echo "os=$( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -s)"
+          echo "mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+          echo "ip=$(hostname -I 2>/dev/null | awk '{print $1}')"
+        fi
         echo "kernel=$(uname -r)"
         echo "arch=$(uname -m)"
         echo "cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)"
-        echo "mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
         echo "uid=$(id -u)"
-        echo "ip=$(hostname -I 2>/dev/null | awk '{print $1}')"
         if [ -e /dev/fuse ]; then echo fuse=1; else echo fuse=0; fi
         if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then echo http=1; else echo http=0; fi
         if [ "$(id -u)" = 0 ] || sudo -n true >/dev/null 2>&1; then echo sudo_nopasswd=1; else echo sudo_nopasswd=0; fi
@@ -62,6 +69,7 @@ public enum RemoteScripts {
         facts.hasHTTPClient = kv["http"].map { $0 == "1" }
         facts.isRoot = kv["uid"].map { $0 == "0" }
         facts.passwordlessSudo = kv["sudo_nopasswd"].map { $0 == "1" }
+        facts.kernelName = kv["kernel_name"].flatMap { $0.isEmpty ? nil : $0 }
         facts.dockerWithoutSudo = kv["docker_user"].map { $0 == "1" }
         facts.installDirectoryWritable = kv["install_writable"].map { $0 == "1" }
         facts.homeDirectory = kv["home"].flatMap { $0.isEmpty ? nil : $0 }
@@ -223,13 +231,53 @@ public enum RemoteScripts {
         public var key: String
         public var directory: String
         public var diagnostics: [DiagnosticsEndpoint]
+        public var runtime: NodeRuntime
 
-        public init(key: String, directory: String, diagnostics: [DiagnosticsEndpoint]) {
+        public init(key: String, directory: String, diagnostics: [DiagnosticsEndpoint], runtime: NodeRuntime = .compose) {
             self.key = key
             self.directory = directory
             self.diagnostics = diagnostics
+            self.runtime = runtime
         }
     }
+
+    // MARK: Dispatch by runtime
+
+    /// Deploys a node with Docker Compose or launchd, as its plan requires.
+    public static func install(_ plan: NodePlan, pullImages: Bool) -> String {
+        plan.runtime == .launchd ? LaunchdScripts.deploy(plan) : deploy(plan, pullImages: pullImages)
+    }
+
+    public static func control(_ action: ComposeAction, plan: NodePlan, service: String? = nil) -> String {
+        plan.runtime == .launchd
+            ? LaunchdScripts.action(action, directory: plan.directory, service: service)
+            : compose(action, directory: plan.directory, service: service)
+    }
+
+    public static func logs(plan: NodePlan, service: String?, tail: Int, follow: Bool) -> String {
+        plan.runtime == .launchd
+            ? LaunchdScripts.logs(directory: plan.directory, service: service, tail: tail, follow: follow)
+            : logs(directory: plan.directory, service: service, tail: tail, follow: follow)
+    }
+
+    public static func remove(_ plan: NodePlan, removeData: Bool) -> String {
+        plan.runtime == .launchd
+            ? LaunchdScripts.uninstall(directory: plan.directory, removeData: removeData)
+            : uninstall(directory: plan.directory, removeData: removeData)
+    }
+
+    /// Host statistics for Linux (/proc) and macOS (sysctl, vm_stat, ps).
+    static let hostStats = """
+    if [ "$(uname -s)" = Darwin ]; then
+      echo '@@loadavg'; sysctl -n vm.loadavg 2>/dev/null | tr -d '{}'
+      echo '@@cpupercent'; ps -A -o %cpu= 2>/dev/null | awk -v n="$(sysctl -n hw.ncpu 2>/dev/null || echo 1)" '{s+=$1} END {if (n > 0) printf "%.1f\\n", s/n}'
+      echo '@@meminfo'; vm_stat 2>/dev/null | awk -v total="$(sysctl -n hw.memsize 2>/dev/null || echo 0)" '/page size of/ {ps=$8} /^Pages free/ {f=$3} /^Pages inactive/ {i=$3} /^Pages speculative/ {s=$3} END {gsub(/\\./,"",f); gsub(/\\./,"",i); gsub(/\\./,"",s); printf "MemTotal: %d kB\\nMemAvailable: %d kB\\n", total/1024, (f+i+s)*ps/1024}'
+    else
+      echo '@@loadavg'; cat /proc/loadavg 2>/dev/null
+      echo '@@stat'; head -n 1 /proc/stat 2>/dev/null
+      echo '@@meminfo'; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null
+    fi
+    """
 
     static let fetchFunction = """
     bbm_fetch() {
@@ -246,9 +294,7 @@ public enum RemoteScripts {
         var script = """
         \(Shell.detectCompose)
         \(fetchFunction)
-        echo '@@loadavg'; cat /proc/loadavg 2>/dev/null
-        echo '@@stat'; head -n 1 /proc/stat 2>/dev/null
-        echo '@@meminfo'; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null
+        \(hostStats)
         echo '@@disk'
         d=\(Shell.quote(installDirectory))
         while [ ! -d "$d" ]; do d=$(dirname "$d"); done
@@ -260,11 +306,21 @@ public enum RemoteScripts {
         """
         for node in nodes {
             let dir = Shell.quote(node.directory)
-            script += """
-            echo '@@compose \(node.key)'
-            if [ -n "$DC" ] && [ -f \(dir)/docker-compose.yml ]; then (cd \(dir) && $DC ps -a --format json 2>/dev/null); fi
+            if node.runtime == .launchd {
+                script += """
+                echo '@@compose \(node.key)'
+                (
+                \(LaunchdScripts.statusSection(directory: node.directory))
+                )
 
-            """
+                """
+            } else {
+                script += """
+                echo '@@compose \(node.key)'
+                if [ -n "$DC" ] && [ -f \(dir)/docker-compose.yml ]; then (cd \(dir) && $DC ps -a --format json 2>/dev/null); fi
+
+                """
+            }
             if includeMetrics {
                 for endpoint in node.diagnostics {
                     script += "echo '@@metrics \(node.key) \(endpoint.service)'; bbm_fetch \(endpoint.port) | grep -v '_bucket{'\n"

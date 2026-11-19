@@ -290,6 +290,109 @@ import Testing
         #expect(rollback.contains("$DC \"$@\" up -d"))
     }
 
+    @Test func nativeMacWorkerPlan() throws {
+        var mac = Machine(name: "build-mac", host: "10.0.0.20", user: "builder", privilege: PrivilegeMode.none, installDirectory: "/Users/builder/buildbarn")
+        var facts = MachineFacts()
+        facts.kernelName = "Darwin"
+        facts.architecture = "arm64"
+        mac.facts = facts
+        #expect(facts.isMacOS)
+        #expect(facts.buildbarnPlatform == "darwin_arm64")
+        #expect(!facts.shouldUseDockerGroup)
+
+        var cluster = ClusterConfiguration()
+        cluster.main = MainNodeSettings(machineID: UUID(), advertisedAddress: "10.0.0.5")
+        var settings = WorkerSettings()
+        settings.kind = .native
+        settings.concurrency = 8
+        settings.platformProperties = [PlatformProperty(name: "OSFamily", value: "darwin")]
+        settings.advertiseContainerImage = false
+        let worker = WorkerNode(machineID: mac.id, settings: settings)
+        cluster.workers = [worker]
+        let generator = ConfigGenerator(cluster: cluster, machines: [mac])
+        #expect(generator.workerReleaseTag == "20261102T094740Z-c9ba98c")
+
+        let plan = try #require(generator.workerPlan(worker))
+        #expect(plan.runtime == .launchd)
+        #expect(plan.directory == "/Users/builder/buildbarn/worker")
+        #expect(plan.nativeRelease == NativeRelease(tag: "20261102T094740Z-c9ba98c", binaries: ["bb_worker", "bb_runner"]))
+        #expect(!plan.files.contains { $0.path == "docker-compose.yml" })
+
+        let config = try #require(plan.files.first { $0.path == "config/worker.jsonnet" }).content
+        #expect(config.contains("buildDirectoryPath: '/Users/builder/buildbarn/worker/build',"))
+        #expect(config.contains("address: 'unix:runner.sock'"))
+        #expect(config.contains("scheduler: { address: '10.0.0.5:8983' }"))
+        #expect(config.contains("{ name: 'OSFamily', value: 'darwin' },"))
+        let common = try #require(plan.files.first { $0.path == "config/common.libsonnet" }).content
+        #expect(common.contains("listenAddresses: ['127.0.0.1:9985'],"))
+        let runner = try #require(plan.files.first { $0.path == "config/runner.jsonnet" }).content
+        #expect(runner.contains("listenPaths: ['runner.sock'],"))
+
+        // launchd agents are valid property lists that start in the worker directory.
+        let plistFile = try #require(plan.files.first { $0.path == "launchd/dev.bbmanager.bb-worker.plist" })
+        let plist = try #require(try PropertyListSerialization.propertyList(from: Data(plistFile.content.utf8), format: nil) as? [String: Any])
+        #expect(plist["Label"] as? String == "dev.bbmanager.bb-worker")
+        #expect(plist["ProgramArguments"] as? [String] == ["/Users/builder/buildbarn/worker/bin/bb_worker", "/Users/builder/buildbarn/worker/config/worker.jsonnet"])
+        #expect(plist["WorkingDirectory"] as? String == "/Users/builder/buildbarn/worker")
+        #expect(plist["KeepAlive"] as? Bool == true)
+
+        let deploy = RemoteScripts.install(plan, pullImages: true)
+        #expect(deploy.contains("base64 -D"))
+        #expect(deploy.contains("https://github.com/buildbarn/bb-remote-execution/releases/download/$TAG/$b.$ARCH"))
+        #expect(deploy.contains("TAG='20261102T094740Z-c9ba98c'"))
+        #expect(deploy.contains("launchctl bootstrap \"$LD\" \"$AGENTS/dev.bbmanager.bb-runner.plist\""))
+        #expect(!deploy.contains("$DC"))
+        #expect(RemoteScripts.control(.restart, plan: plan, service: "worker").contains("launchctl kickstart -k \"$LD/dev.bbmanager.bb-worker\""))
+        #expect(RemoteScripts.logs(plan: plan, service: nil, tail: 100, follow: true).contains("tail -n 100 -F logs/runner.log logs/worker.log"))
+        #expect(RemoteScripts.remove(plan, removeData: false).contains("rm -f \"$AGENTS/dev.bbmanager.bb-worker.plist\""))
+
+        let poll = RemoteScripts.poll(installDirectory: mac.installDirectory, nodes: [
+            RemoteScripts.PollNode(key: "worker", directory: plan.directory, diagnostics: plan.diagnostics, runtime: .launchd),
+        ], includeMetrics: true)
+        #expect(poll.contains("bbm_status worker '/Users/builder/buildbarn/worker'"))
+        #expect(poll.contains("sysctl -n vm.loadavg"))
+    }
+
+    @Test func parsesMacOSHostStatsAndLaunchdStatus() throws {
+        let text = """
+        @@loadavg
+         1.50 1.20 1.00
+        @@cpupercent
+        12.5
+        @@meminfo
+        MemTotal: 16777216 kB
+        MemAvailable: 4194304 kB
+        @@disk
+        /dev/disk3s1s1 1000000 400000 600000 40% /
+        @@compose worker
+        {"Name":"bb-runner","Service":"runner","State":"running","Status":"Running (pid 42)","Image":"bb_runner 2026 darwin_arm64"}
+        {"Name":"bb-worker","Service":"worker","State":"stopped","Status":"Not loaded","Image":"bb_worker 2026 darwin_arm64"}
+        """
+        let output = PollOutput(text)
+        let host = output.host(previousCPU: nil)
+        #expect(host.load1 == 1.5)
+        #expect(host.cpuUsage == 0.125)
+        #expect(host.memoryUsage == 0.75)
+        let services = try #require(output.containers(nodeKey: "worker"))
+        #expect(services.map(\.service) == ["runner", "worker"])
+        #expect(services[0].isRunning)
+        #expect(!services[1].isRunning)
+    }
+
+    @Test func parsesMacOSFacts() {
+        let facts = RemoteScripts.facts(
+            preflight: "kernel_name=Darwin\nos=macOS 15.6\narch=arm64\ncpus=12\nmem_kb=33554432\nuid=501\nhome=/Users/builder\ninstall_writable=0\nsudo_nopasswd=0\ndocker_user=0",
+            docker: "docker=\ncompose="
+        )
+        #expect(facts.isMacOS)
+        #expect(facts.osName == "macOS 15.6")
+        #expect(facts.buildbarnPlatform == "darwin_arm64")
+        var machine = Machine(host: "mac", privilege: .sudoWithPassword, facts: facts)
+        machine.adoptNativeMode()
+        #expect(machine.privilege == PrivilegeMode.none)
+        #expect(machine.installDirectory == "/Users/builder/buildbarn")
+    }
+
     @Test func parsesComposeJSONArray() {
         let containers = ContainerStatus.parse(#"[{"Name":"a","Service":"b","State":"running","Status":"Up","Image":"i"}]"#)
         #expect(containers.count == 1)

@@ -426,7 +426,7 @@ struct LogsTab: View {
         guard let plan = model.plan(role) else { return }
         buffer.clear()
         status = follow ? "Streaming…" : "Loading…"
-        let script = RemoteScripts.logs(directory: plan.directory, service: service, tail: tail, follow: follow)
+        let script = RemoteScripts.logs(plan: plan, service: service, tail: tail, follow: follow)
         do {
             for try await chunk in model.ssh.stream(plan.machine, script: script, privileged: true) {
                 buffer.append(chunk)

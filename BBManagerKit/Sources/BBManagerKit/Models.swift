@@ -51,6 +51,8 @@ public struct MachineFacts: Codable, Hashable, Sendable {
     public var composeVersion: String?
     public var hasFuse: Bool?
     public var hasHTTPClient: Bool?
+    /// `uname -s`: "Linux" or "Darwin".
+    public var kernelName: String?
     public var diskTotalBytes: Int64?
     public var diskAvailableBytes: Int64?
     public var isRoot: Bool?
@@ -70,9 +72,22 @@ public struct MachineFacts: Codable, Hashable, Sendable {
 
     public var dockerReady: Bool { dockerVersion?.isEmpty == false && composeVersion?.isEmpty == false }
 
+    /// macOS machines run workers natively (no Docker) and cannot host the main node.
+    public var isMacOS: Bool { kernelName == "Darwin" }
+
+    /// Buildbarn's release asset suffix for this machine, e.g. `darwin_arm64`.
+    public var buildbarnPlatform: String? {
+        guard isMacOS else { return nil }
+        switch architecture {
+        case "arm64": return "darwin_arm64"
+        case "x86_64": return "darwin_amd64"
+        default: return nil
+        }
+    }
+
     /// sudo is unusable without a password, but Docker works directly (docker group).
     public var shouldUseDockerGroup: Bool {
-        isRoot != true && passwordlessSudo == false && dockerWithoutSudo == true
+        !isMacOS && isRoot != true && passwordlessSudo == false && dockerWithoutSudo == true
     }
 
     /// Install directory to use when switching to the docker group, if the current one needs root.
@@ -130,6 +145,14 @@ public struct Machine: Codable, Identifiable, Hashable, Sendable {
     /// Switches to running Docker as the SSH user (docker group), moving the install
     /// directory into the home directory when the current one needs root.
     public mutating func adoptDockerGroup() {
+        privilege = .none
+        if let directory = facts?.dockerGroupInstallDirectory(current: installDirectory) {
+            installDirectory = directory
+        }
+    }
+
+    /// macOS workers run as the SSH user from the home directory, without sudo or Docker.
+    public mutating func adoptNativeMode() {
         privilege = .none
         if let directory = facts?.dockerGroupInstallDirectory(current: installDirectory) {
             installDirectory = directory
@@ -253,6 +276,8 @@ public enum WorkerKind: String, Codable, CaseIterable, Sendable, Identifiable {
     case fuse
     /// Classic build directory populated with hardlinks from a local cache.
     case hardlinking
+    /// bb_worker and bb_runner run directly on macOS under launchd, without Docker.
+    case native
 
     public var id: String { rawValue }
 
@@ -260,7 +285,21 @@ public enum WorkerKind: String, Codable, CaseIterable, Sendable, Identifiable {
         switch self {
         case .fuse: "FUSE (recommended)"
         case .hardlinking: "Hardlinking"
+        case .native: "Native (macOS, no Docker)"
         }
+    }
+
+    public var shortLabel: String {
+        switch self {
+        case .fuse: "FUSE"
+        case .hardlinking: "Hardlinking"
+        case .native: "Native macOS"
+        }
+    }
+
+    /// Kinds a machine can run.
+    public static func available(onMacOS: Bool) -> [WorkerKind] {
+        onMacOS ? [.native] : [.fuse, .hardlinking]
     }
 }
 

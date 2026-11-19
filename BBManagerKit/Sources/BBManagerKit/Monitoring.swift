@@ -34,6 +34,7 @@ public struct PollOutput: Sendable {
             stat: self["stat"] ?? "",
             meminfo: self["meminfo"] ?? "",
             disk: self["disk"] ?? "",
+            cpuPercent: self["cpupercent"],
             previousCPU: previousCPU
         )
     }
@@ -89,8 +90,12 @@ public struct HostSample: Sendable {
         return Double(total - available) / Double(total)
     }
 
-    public init(loadavg: String, stat: String, meminfo: String, disk: String, previousCPU: CPUCounters?, timestamp: Date = Date()) {
+    public init(loadavg: String, stat: String, meminfo: String, disk: String, cpuPercent: String? = nil, previousCPU: CPUCounters?, timestamp: Date = Date()) {
         self.timestamp = timestamp
+        // macOS has no /proc/stat; the poll script reports a percentage directly.
+        if let cpuPercent, let percent = Double(cpuPercent.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            cpuUsage = min(1, max(0, percent / 100))
+        }
         let load = loadavg.split(separator: " ").compactMap { Double($0) }
         if load.count >= 3 {
             load1 = load[0]; load5 = load[1]; load15 = load[2]

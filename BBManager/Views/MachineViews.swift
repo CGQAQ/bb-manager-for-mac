@@ -90,6 +90,8 @@ struct MachineDetailView: View {
                 HStack {
                     if model.cluster.main == nil {
                         Button("Use as Main Node…") { model.sheet = .setUpMainNode }
+                            .disabled(machine.facts?.isMacOS == true)
+                            .help(machine.facts?.isMacOS == true ? "The main node needs Docker on Linux. Macs can run native workers." : "")
                     }
                     if model.cluster.main != nil && !roles.contains(where: { !$0.isMain }) {
                         Button("Add as Worker…") { model.sheet = .addWorker(preselectedMachine: machine.id) }
@@ -113,9 +115,14 @@ struct MachineDetailView: View {
                     LabeledContent("CPUs", value: facts.cpuCount.map(String.init) ?? "—")
                     LabeledContent("Memory", value: Format.bytes(facts.memoryBytes))
                     LabeledContent("Primary Address", value: facts.primaryAddress ?? "—")
-                    LabeledContent("Docker", value: nonEmpty(facts.dockerVersion) ?? "Not available")
-                    LabeledContent("Docker Compose", value: nonEmpty(facts.composeVersion) ?? "Not available")
-                    LabeledContent("FUSE", value: facts.hasFuse == true ? "Available" : "Not available (use hardlinking workers)")
+                    if facts.isMacOS {
+                        LabeledContent("Workers", value: "Native (bb_worker under launchd, no Docker)")
+                        LabeledContent("Buildbarn Binaries", value: facts.buildbarnPlatform ?? "Unsupported CPU")
+                    } else {
+                        LabeledContent("Docker", value: nonEmpty(facts.dockerVersion) ?? "Not available")
+                        LabeledContent("Docker Compose", value: nonEmpty(facts.composeVersion) ?? "Not available")
+                        LabeledContent("FUSE", value: facts.hasFuse == true ? "Available" : "Not available (use hardlinking workers)")
+                    }
                     LabeledContent("curl / wget", value: facts.hasHTTPClient == true ? "Available" : "Missing — metrics need one of them")
                     LabeledContent("Disk Free", value: "\(Format.bytes(facts.diskAvailableBytes)) of \(Format.bytes(facts.diskTotalBytes))")
                 } else {
@@ -171,6 +178,7 @@ struct MachineDetailView: View {
                 }
                 Menu {
                     Button("Install Docker…") { confirmDocker = true }
+                        .disabled(machine.facts?.isMacOS == true)
                     Divider()
                     Button("Remove Machine…", role: .destructive) { confirmRemove = true }
                         .disabled(!model.canRemoveMachine(machine.id))
@@ -222,6 +230,12 @@ struct MachineDetailView: View {
         } else if let error = facts?.privilegeError {
             Banner(symbol: "lock.trianglebadge.exclamationmark.fill", tint: .orange, text: "Privileged commands failed: \(error)", actionTitle: "Edit…") {
                 model.sheet = .editMachine(machine.id)
+            }
+        } else if machine.facts?.isMacOS == true {
+            if model.roles(on: machine.id).isEmpty {
+                Banner(symbol: "apple.logo", tint: .accentColor, text: "This Mac can run a native worker: BB Manager installs bb_worker and bb_runner in \(machine.installDirectory) and keeps them running with launchd. No Docker needed.", actionTitle: model.cluster.main == nil ? nil : "Add as Worker…") {
+                    model.sheet = .addWorker(preselectedMachine: machine.id)
+                }
             }
         } else if let facts, facts.dockerVersion?.isEmpty ?? false {
             Banner(symbol: "shippingbox", tint: .orange, text: "Docker is not installed.", actionTitle: "Install Docker…") {
@@ -472,7 +486,7 @@ struct MachineEditorSheet: View {
                     .foregroundStyle(.secondary)
                 if let docker = facts.dockerVersion, !docker.isEmpty {
                     Text("Docker \(docker) · Compose \(facts.composeVersion ?? "missing")").foregroundStyle(.secondary)
-                } else if facts.privilegeError == nil {
+                } else if facts.privilegeError == nil && !facts.isMacOS {
                     Text("Docker not found — you can install it from the machine's page after adding it.").foregroundStyle(.orange)
                 }
                 if let note {
@@ -524,7 +538,18 @@ struct MachineEditorSheet: View {
                 var facts = try await model.inspect(machine)
                 var note: String?
                 var warning: String?
-                if facts.isRoot == true && draft.privilege != .none {
+                if facts.isMacOS {
+                    // Macs run native workers as this user: no sudo, no Docker.
+                    draft.facts = facts
+                    let previousDirectory = draft.installDirectory
+                    let previousPrivilege = draft.privilege
+                    draft.adoptNativeMode()
+                    note = "This is a Mac, so it runs native workers (bb_worker under launchd) without Docker or sudo"
+                        + (draft.installDirectory != previousDirectory ? ", installed in \(draft.installDirectory)." : ".")
+                    if draft.installDirectory != previousDirectory || draft.privilege != previousPrivilege {
+                        facts = try await model.inspect(normalizedDraft())
+                    }
+                } else if facts.isRoot == true && draft.privilege != .none {
                     draft.privilege = .none
                     facts = try await model.inspect(normalizedDraft())
                 } else if facts.shouldUseDockerGroup && draft.privilege != .none {
@@ -536,7 +561,11 @@ struct MachineEditorSheet: View {
                         + (draft.installDirectory != previousDirectory ? " and install into \(draft.installDirectory)." : ".")
                     facts = try await model.inspect(normalizedDraft())
                 }
-                if let error = facts.privilegeError {
+                if facts.isMacOS {
+                    if facts.buildbarnPlatform == nil {
+                        warning = "Buildbarn publishes no macOS build for this CPU (\(facts.architecture ?? "unknown"))."
+                    }
+                } else if let error = facts.privilegeError {
                     warning = "Privileged commands failed: \(error)"
                 } else if facts.isRoot == false && facts.passwordlessSudo == false && draft.privilege == .sudo {
                     warning = "Passwordless sudo is not available. Choose “sudo with password” or add the user to the docker group."

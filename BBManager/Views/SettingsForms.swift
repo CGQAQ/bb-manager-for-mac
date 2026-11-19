@@ -169,10 +169,12 @@ struct WorkerSettingsSections: View {
     @Binding var settings: WorkerSettings
     var machine: Machine?
 
+    private var isNative: Bool { settings.kind == .native }
+
     var body: some View {
         Section {
             Picker("Build Directory", selection: $settings.kind) {
-                ForEach(WorkerKind.allCases) { Text($0.label).tag($0) }
+                ForEach(WorkerKind.available(onMacOS: machine?.facts?.isMacOS == true || isNative)) { Text($0.label).tag($0) }
             }
             if settings.kind == .fuse, machine?.facts?.hasFuse == false {
                 Label("This machine has no /dev/fuse. Use a hardlinking worker or install FUSE.", systemImage: "exclamationmark.triangle.fill")
@@ -184,27 +186,36 @@ struct WorkerSettingsSections: View {
         } header: {
             Text("Execution")
         } footer: {
-            Text(settings.kind == .fuse
-                 ? "FUSE workers expose inputs lazily through a virtual file system. They are the most efficient but need privileged containers and /dev/fuse."
-                 : "Hardlinking workers copy inputs from a local cache into a real directory. Use them where FUSE is not available.")
+            switch settings.kind {
+            case .fuse:
+                Text("FUSE workers expose inputs lazily through a virtual file system. They are the most efficient but need privileged containers and /dev/fuse.")
+            case .hardlinking:
+                Text("Hardlinking workers copy inputs from a local cache into a real directory. Use them where FUSE is not available.")
+            case .native:
+                Text("bb_worker and bb_runner run directly on this Mac as launchd agents of the SSH user, downloaded from Buildbarn's release that matches the cluster. Inputs are hardlinked from a local cache.")
+            }
         }
 
         Section {
-            ImageField(title: "Runner Image", text: $settings.runnerImage)
-            Toggle(isOn: $settings.advertiseContainerImage) {
-                Text("Advertise container-image Property")
-                Text("Adds container-image=docker://<runner image> to the worker's platform.")
+            if !isNative {
+                ImageField(title: "Runner Image", text: $settings.runnerImage)
+                Toggle(isOn: $settings.advertiseContainerImage) {
+                    Text("Advertise container-image Property")
+                    Text("Adds container-image=docker://<runner image> to the worker's platform.")
+                }
             }
             PlatformPropertiesEditor(properties: $settings.platformProperties)
         } header: {
             Text("Execution Environment")
         } footer: {
-            Text("Actions run inside the runner image. Bazel's exec properties must match the platform properties exactly; the Overview shows matching .bazelrc lines.")
+            Text(isNative
+                 ? "Actions run directly on this Mac with the tools installed there, such as Xcode. Bazel's exec properties must match the platform properties exactly."
+                 : "Actions run inside the runner image. Bazel's exec properties must match the platform properties exactly; the Overview shows matching .bazelrc lines.")
         }
 
         Section("Caching") {
             NumberField(title: settings.kind == .fuse ? "Local Blob Cache" : "Local File Cache", value: $settings.localCacheSizeGiB, unit: "GiB", range: 1...4096, step: 4)
-            if settings.kind == .hardlinking {
+            if settings.kind != .fuse {
                 IntegerField(title: "Maximum Cached Files", value: $settings.maximumCacheFileCount, range: 100...100_000_000, step: 10_000)
             } else {
                 NumberField(title: "Scratch Space per Action", value: $settings.filePoolPerActionGiB, unit: "GiB", range: 0.125...256, step: 0.5,

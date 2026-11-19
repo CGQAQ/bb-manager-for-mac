@@ -165,7 +165,7 @@ struct NodesCard: View {
                 }
                 ForEach(model.cluster.workers) { worker in
                     Divider()
-                    row(.worker(worker.id), subtitle: "\(worker.settings.kind == .fuse ? "FUSE" : "Hardlinking") · \(worker.settings.concurrency) slots")
+                    row(.worker(worker.id), subtitle: "\(worker.settings.kind.shortLabel) · \(worker.settings.concurrency) slots")
                 }
                 if model.cluster.workers.isEmpty {
                     Divider()

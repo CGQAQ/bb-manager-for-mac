@@ -29,9 +29,14 @@ struct MachineReadiness: View {
         if let machine {
             if let facts = machine.facts {
                 VStack(alignment: .leading, spacing: 4) {
-                    check(facts.dockerReady, facts.dockerReady
-                          ? "Docker \(facts.dockerVersion ?? "") with Compose \(facts.composeVersion ?? "")"
-                          : "Docker or Docker Compose is missing — install it from the machine's page first.")
+                    if facts.isMacOS {
+                        check(facts.buildbarnPlatform != nil, facts.buildbarnPlatform.map { "\(facts.osName ?? "macOS"): runs Buildbarn's \($0) binaries natively, no Docker needed" }
+                              ?? "This Mac's CPU (\(facts.architecture ?? "unknown")) has no Buildbarn build.")
+                    } else {
+                        check(facts.dockerReady, facts.dockerReady
+                              ? "Docker \(facts.dockerVersion ?? "") with Compose \(facts.composeVersion ?? "")"
+                              : "Docker or Docker Compose is missing — install it from the machine's page first.")
+                    }
                     check(facts.hasHTTPClient == true, facts.hasHTTPClient == true ? "curl or wget available for metrics" : "Neither curl nor wget is installed; statistics will be empty.")
                     if needsFuse {
                         check(facts.hasFuse == true, facts.hasFuse == true ? "/dev/fuse available" : "No /dev/fuse — choose the hardlinking build directory.")
@@ -68,7 +73,7 @@ struct SetUpMainNodeSheet: View {
             Form {
                 Section {
                     Picker("Machine", selection: $machineID) {
-                        ForEach(model.machines) { machine in
+                        ForEach(model.machines.filter { $0.facts?.isMacOS != true }) { machine in
                             Text(machine.displayName).tag(Optional(machine.id))
                         }
                     }
@@ -187,10 +192,18 @@ struct AddWorkerSheet: View {
             if let cpus = machine.facts?.cpuCount, cpus > 0 {
                 settings.concurrency = cpus
             }
-            if machine.facts?.hasFuse == false {
-                settings.kind = .hardlinking
+            // New workers join the instance name the existing workers already serve.
+            if let existing = model.cluster.workers.first?.settings.instanceNamePrefix {
+                settings.instanceNamePrefix = existing
+            }
+            if machine.facts?.isMacOS == true {
+                settings.kind = .native
+                settings.advertiseContainerImage = false
+                settings.platformProperties = [PlatformProperty(name: "OSFamily", value: "darwin")]
             } else {
-                settings.kind = model.cluster.workerDefaults.kind
+                settings.platformProperties = model.cluster.workerDefaults.platformProperties
+                settings.advertiseContainerImage = model.cluster.workerDefaults.advertiseContainerImage
+                settings.kind = machine.facts?.hasFuse == false ? .hardlinking : model.cluster.workerDefaults.kind
             }
         }
     }

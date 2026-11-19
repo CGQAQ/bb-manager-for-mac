@@ -30,6 +30,8 @@ final class AppModel {
     var hostSamples: [UUID: HostSample] = [:]
     var hostHistory: [UUID: [HostPoint]] = [:]
     var containerUsage: [UUID: [ContainerUsage]] = [:]
+    /// Buildbarn Compose projects seen on each machine, including ones BB Manager didn't create.
+    var discoveredProjects: [UUID: [ComposeProject]] = [:]
     var nodeRuntime: [NodeRole: NodeRuntime] = [:]
     var metrics: [MetricsKey: MetricsSnapshot] = [:]
     var previousMetrics: [MetricsKey: MetricsSnapshot] = [:]
@@ -45,6 +47,7 @@ final class AppModel {
     @ObservationIgnored private var saveTask: Task<Void, Never>?
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var inFlightPolls: Set<UUID> = []
+    @ObservationIgnored private var inspectedThisSession: Set<UUID> = []
     @ObservationIgnored private var isLoading = false
 
     init() {
@@ -247,10 +250,27 @@ final class AppModel {
     }
 
     /// Connects, gathers facts, and checks Docker with the machine's privilege mode.
+    ///
+    /// Throws only when the machine can't be reached. A failing privileged check
+    /// (for example sudo wanting a password) is recorded in `privilegeError`.
     func inspect(_ machine: Machine) async throws -> MachineFacts {
         let preflight = try await ssh.runChecked(machine, script: RemoteScripts.preflight(installDirectory: machine.installDirectory), timeout: 30)
-        let docker = try await ssh.run(machine, script: RemoteScripts.dockerCheck, privileged: true, timeout: 30)
-        return RemoteScripts.facts(preflight: preflight.stdout, docker: docker.stdout)
+        var dockerOutput: String?
+        var privilegeError: String?
+        do {
+            let result = try await ssh.run(machine, script: RemoteScripts.dockerCheck, privileged: true, timeout: 30)
+            if result.succeeded {
+                dockerOutput = result.stdout
+            } else {
+                privilegeError = result.failureMessage
+            }
+        } catch {
+            if case .offline = Connectivity.from(error) { throw error }
+            privilegeError = error.localizedDescription
+        }
+        var facts = RemoteScripts.facts(preflight: preflight.stdout, docker: dockerOutput)
+        facts.privilegeError = privilegeError
+        return facts
     }
 
     /// Re-runs the preflight for a saved machine and stores the result.
@@ -262,9 +282,38 @@ final class AppModel {
             if let index = machines.firstIndex(where: { $0.id == id }) {
                 machines[index].facts = facts
             }
-            connectivity[id] = .online
+            connectivity[id] = facts.privilegeError.map { .limited($0) } ?? .online
         } catch {
-            connectivity[id] = .offline(error.localizedDescription)
+            connectivity[id] = Connectivity.from(error)
+        }
+    }
+
+    /// Runs Docker as the SSH user (docker group) instead of through sudo.
+    func useDockerGroup(_ id: UUID) {
+        guard var machine = machine(id) else { return }
+        let hasDeployedNodes = roles(on: id).contains { deployedAt($0) != nil }
+        if hasDeployedNodes {
+            // Keep the directory existing deployments live in.
+            machine.privilege = .none
+        } else {
+            machine.adoptDockerGroup()
+        }
+        saveMachine(machine, password: nil)
+        Task { await refreshFacts(id) }
+    }
+
+    /// Buildbarn projects on a machine that BB Manager didn't deploy.
+    func unmanagedProjects(on machineID: UUID) -> [ComposeProject] {
+        let managedDirectories = Set(roles(on: machineID).compactMap { plan($0)?.directory })
+        return (discoveredProjects[machineID] ?? []).filter { !managedDirectories.contains($0.workingDirectory) }
+    }
+
+    /// Host ports a node would publish that another Buildbarn deployment on the same machine already uses.
+    func portConflicts(_ role: NodeRole) -> [(port: Int, project: String)] {
+        guard let plan = plan(role) else { return [] }
+        let planned = Set(plan.hostPorts)
+        return unmanagedProjects(on: plan.machine.id).flatMap { project in
+            project.hostPorts.intersection(planned).sorted().map { (port: $0, project: project.name) }
         }
     }
 
@@ -416,6 +465,135 @@ final class AppModel {
         metrics = metrics.filter { $0.key.role != role }
     }
 
+    // MARK: - Taking over existing deployments
+
+    /// Why a project can't be taken over right now, or nil if it can.
+    func takeOverBlocker(on machineID: UUID) -> String? {
+        if case .online = connectivity[machineID] ?? .unknown {} else {
+            return "The machine must be online with working Docker access."
+        }
+        if let main = cluster.main, main.deployedAt != nil {
+            return "This cluster already has a deployed main node on \(mainMachine?.displayName ?? "another machine"). Remove it first."
+        }
+        if operation?.isRunning == true {
+            return "Another operation is running."
+        }
+        return nil
+    }
+
+    /// Makes a hand-made Buildbarn deployment fully managed by BB Manager in one step:
+    /// survey it, import its settings, stop it, and deploy BB Manager's main node and
+    /// worker in its place. If deploying fails or is cancelled, the new containers are
+    /// removed and the old deployment is started again. Its files are never deleted.
+    func takeOver(_ project: ComposeProject, on machineID: UUID) {
+        guard let machine = machine(machineID) else { return }
+        if let blocker = takeOverBlocker(on: machineID) {
+            alert = AlertItem(title: "Cannot Take Over \(project.name)", message: blocker)
+            return
+        }
+        let session = OperationSession(title: "Take Over \(project.name)", machineName: machine.displayName)
+        operation = session
+        session.task = Task { [weak self] in
+            guard let self else { return }
+            @MainActor func run(_ script: String) async throws {
+                for try await chunk in self.ssh.stream(machine, script: script, privileged: true) {
+                    session.log.append(chunk)
+                }
+                try Task.checkCancellation()
+            }
+
+            do {
+                session.log.append("==> Reading \(project.name)'s settings from the running system\n")
+                let survey = try await ssh.runChecked(machine, script: TakeoverSurvey.script(project: project.name), privileged: true, timeout: 120)
+                let takeover = TakeoverSurvey.plan(output: survey.stdout, project: project, machine: machine, existing: cluster)
+                for finding in takeover.findings { session.log.append("    • \(finding)\n") }
+                for warning in takeover.warnings { session.log.append("    ! \(warning)\n") }
+                if takeover.cacheBytes > 0 {
+                    session.log.append("    • \(Format.bytes(takeover.cacheBytes)) of cached build data is not carried over; builds refill the cache.\n")
+                }
+                try Task.checkCancellation()
+
+                // Import the settings.
+                cluster.images = takeover.images
+                cluster.main = takeover.main
+                var roles: [NodeRole] = [.main]
+                if let workerSettings = takeover.worker {
+                    if let index = cluster.workers.firstIndex(where: { $0.machineID == machineID }) {
+                        cluster.workers[index].settings = workerSettings
+                        cluster.workers[index].fileOverrides = [:]
+                        cluster.workers[index].deployedAt = nil
+                        cluster.workers[index].deployedFingerprint = nil
+                        roles.append(.worker(cluster.workers[index].id))
+                    } else {
+                        let node = WorkerNode(machineID: machineID, settings: workerSettings)
+                        cluster.workers.append(node)
+                        roles.append(.worker(node.id))
+                    }
+                }
+                let plans = roles.compactMap { role in plan(role).map { (role, $0) } }
+                guard plans.count == roles.count else {
+                    throw SSHError.commandFailed(exitCode: 1, message: "Could not generate the new configuration.")
+                }
+                session.log.append("==> Imported the settings into BB Manager\n")
+
+                do {
+                    session.log.append("\n━━━ Stopping \(project.name) ━━━\n")
+                    try await run(TakeoverSurvey.stopScript(takeover))
+                    for (role, nodePlan) in plans {
+                        session.log.append("\n━━━ Deploying \(title(for: role)) ━━━\n")
+                        try await run(RemoteScripts.deploy(nodePlan, pullImages: true))
+                        markDeployed(role, fingerprint: nodePlan.fingerprint)
+                    }
+                } catch {
+                    let cancelled = Task.isCancelled
+                    session.log.append("\n\(cancelled ? "Cancelled." : error.localizedDescription)\n\n━━━ Rolling back: starting \(project.name) again ━━━\n")
+                    for (role, _) in plans { clearDeployed(role) }
+                    // Not inherited: the rollback must run even after Cancel.
+                    let rollback = TakeoverSurvey.rollbackScript(takeover, newDirectories: plans.map(\.1.directory))
+                    let rollbackTask = Task { @MainActor in
+                        for try await chunk in self.ssh.stream(machine, script: rollback, privileged: true) {
+                            session.log.append(chunk)
+                        }
+                    }
+                    do {
+                        try await rollbackTask.value
+                        session.log.append("\n\(project.name) is running again. The imported settings are kept in BB Manager so you can adjust them and try again.\n")
+                    } catch {
+                        session.log.append("\nRollback failed: \(error.localizedDescription)\nStart it by hand with: cd \(takeover.workingDirectory) && docker compose up -d\n")
+                    }
+                    session.state = cancelled ? .cancelled : .failed(error.localizedDescription)
+                    await pollAll()
+                    return
+                }
+
+                session.log.append("\n==> \(project.name) is now managed by BB Manager.\n    Its previous files and data are still in \(takeover.workingDirectory); delete that folder once you no longer need it.\n")
+                session.state = .succeeded
+                selection = .mainNode
+            } catch {
+                if Task.isCancelled {
+                    session.state = .cancelled
+                } else {
+                    session.log.append("\n\(error.localizedDescription)\n")
+                    session.state = .failed(error.localizedDescription)
+                }
+            }
+            await pollAll()
+        }
+    }
+
+    private func clearDeployed(_ role: NodeRole) {
+        switch role {
+        case .main:
+            cluster.main?.deployedAt = nil
+            cluster.main?.deployedFingerprint = nil
+        case .worker(let id):
+            if let index = cluster.workers.firstIndex(where: { $0.id == id }) {
+                cluster.workers[index].deployedAt = nil
+                cluster.workers[index].deployedFingerprint = nil
+            }
+        }
+    }
+
     // MARK: - Operations console
 
     func runOperation(title: String, machine: Machine, script: String, privileged: Bool = true, onSuccess: @escaping @MainActor () async -> Void = {}) {
@@ -492,7 +670,16 @@ final class AppModel {
             let result = try await ssh.run(machine, script: script, privileged: true, timeout: 30)
             let now = Date()
             let output = PollOutput(result.stdout)
+            // The script's last command may legitimately fail (grep with no matches),
+            // so judge it by whether the sections came back, not by the exit status.
+            guard output["loadavg"] != nil else {
+                connectivity[machineID] = .limited("The status check failed: \(result.failureMessage)")
+                return
+            }
             connectivity[machineID] = .online
+            if let projects = output.buildbarnProjects {
+                discoveredProjects[machineID] = projects
+            }
 
             let sample = output.host(previousCPU: hostSamples[machineID]?.cpu)
             hostSamples[machineID] = sample
@@ -514,14 +701,18 @@ final class AppModel {
                     }
                 }
             }
-            if machine.facts == nil {
-                await refreshFacts(machineID)
-            }
         } catch {
-            connectivity[machineID] = .offline(error.localizedDescription)
+            connectivity[machineID] = Connectivity.from(error)
             for (role, _) in nodes {
                 nodeRuntime[role, default: NodeRuntime()].error = error.localizedDescription
             }
+        }
+        // Re-inspect each machine once per launch so saved facts don't go stale
+        // (Docker installed since, group membership changed, newer checks added).
+        if !inspectedThisSession.contains(machineID), (connectivity[machineID] ?? .unknown) != .unknown {
+            if case .offline = connectivity[machineID] ?? .unknown { return }
+            inspectedThisSession.insert(machineID)
+            await refreshFacts(machineID)
         }
     }
 

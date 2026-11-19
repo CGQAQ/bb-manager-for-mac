@@ -41,6 +41,8 @@ enum Connectivity: Equatable {
     case unknown
     case checking
     case online
+    /// Reachable over SSH, but privileged commands (Docker) fail.
+    case limited(String)
     case offline(String)
 
     var color: Color {
@@ -48,6 +50,7 @@ enum Connectivity: Equatable {
         case .unknown: .secondary
         case .checking: .yellow
         case .online: .green
+        case .limited: .orange
         case .offline: .red
         }
     }
@@ -57,8 +60,23 @@ enum Connectivity: Equatable {
         case .unknown: "Not checked"
         case .checking: "Connecting…"
         case .online: "Online"
+        case .limited: "Limited access"
         case .offline: "Unreachable"
         }
+    }
+
+    /// Connection problems make a machine unreachable; anything else (such as sudo
+    /// refusing) means it is reachable with limited access.
+    static func from(_ error: Error) -> Connectivity {
+        if let error = error as? SSHError {
+            switch error {
+            case .connectionFailed, .timedOut, .launchFailed:
+                return .offline(error.localizedDescription)
+            default:
+                return .limited(error.localizedDescription)
+            }
+        }
+        return .offline(error.localizedDescription)
     }
 }
 

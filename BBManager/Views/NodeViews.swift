@@ -156,6 +156,32 @@ struct NodeHeader: View {
             if let error = model.nodeRuntime[role]?.error, health == .unreachable {
                 Banner(symbol: "bolt.horizontal.circle.fill", tint: .red, text: error)
             }
+            let conflicts = model.portConflicts(role)
+            if !conflicts.isEmpty, let machine {
+                let ports = conflicts.map { String($0.port) }.joined(separator: ", ")
+                let names = Set(conflicts.map(\.project)).sorted()
+                let projects = model.unmanagedProjects(on: machine.id).filter { names.contains($0.name) }
+                // One conflicting deployment on the main node's machine: offer to take it over.
+                if role.isMain, projects.count == 1, let project = projects.first, model.takeOverBlocker(on: machine.id) == nil {
+                    Banner(
+                        symbol: "exclamationmark.triangle.fill",
+                        tint: .orange,
+                        text: "Port\(conflicts.count == 1 ? "" : "s") \(ports) \(conflicts.count == 1 ? "is" : "are") used by \(project.name), which runs here outside BB Manager. Take it over to manage it from here with its current settings.",
+                        actionTitle: "Take Over \(project.name)"
+                    ) {
+                        model.takeOver(project, on: machine.id)
+                    }
+                } else {
+                    Banner(
+                        symbol: "exclamationmark.triangle.fill",
+                        tint: .orange,
+                        text: "Port\(conflicts.count == 1 ? "" : "s") \(ports) \(conflicts.count == 1 ? "is" : "are") already used by \(names.joined(separator: ", ")) on this machine. Stop it or change the ports in Settings before deploying.",
+                        actionTitle: "Show Machine"
+                    ) {
+                        model.selection = .machine(machine.id)
+                    }
+                }
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)

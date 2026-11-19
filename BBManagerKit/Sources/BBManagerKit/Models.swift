@@ -55,6 +55,13 @@ public struct MachineFacts: Codable, Hashable, Sendable {
     public var diskAvailableBytes: Int64?
     public var isRoot: Bool?
     public var passwordlessSudo: Bool?
+    /// The SSH user can talk to Docker without sudo (root or member of the docker group).
+    public var dockerWithoutSudo: Bool?
+    /// The SSH user can create the install directory without sudo.
+    public var installDirectoryWritable: Bool?
+    public var homeDirectory: String?
+    /// Why the privileged check failed (for example sudo wanting a password).
+    public var privilegeError: String?
     public var checkedAt: Date
 
     public init(checkedAt: Date = Date()) {
@@ -62,6 +69,17 @@ public struct MachineFacts: Codable, Hashable, Sendable {
     }
 
     public var dockerReady: Bool { dockerVersion?.isEmpty == false && composeVersion?.isEmpty == false }
+
+    /// sudo is unusable without a password, but Docker works directly (docker group).
+    public var shouldUseDockerGroup: Bool {
+        isRoot != true && passwordlessSudo == false && dockerWithoutSudo == true
+    }
+
+    /// Install directory to use when switching to the docker group, if the current one needs root.
+    public func dockerGroupInstallDirectory(current: String) -> String? {
+        guard installDirectoryWritable == false, let home = homeDirectory, home.hasPrefix("/"), home != "/" else { return nil }
+        return (home.hasSuffix("/") ? String(home.dropLast()) : home) + "/buildbarn"
+    }
 }
 
 public struct Machine: Codable, Identifiable, Hashable, Sendable {
@@ -108,6 +126,15 @@ public struct Machine: Codable, Identifiable, Hashable, Sendable {
     public var keychainAccount: String { id.uuidString }
 
     public var needsStoredPassword: Bool { auth == .password || privilege == .sudoWithPassword }
+
+    /// Switches to running Docker as the SSH user (docker group), moving the install
+    /// directory into the home directory when the current one needs root.
+    public mutating func adoptDockerGroup() {
+        privilege = .none
+        if let directory = facts?.dockerGroupInstallDirectory(current: installDirectory) {
+            installDirectory = directory
+        }
+    }
 
     /// Validation messages for the editor. Empty means valid.
     public var validationErrors: [String] {

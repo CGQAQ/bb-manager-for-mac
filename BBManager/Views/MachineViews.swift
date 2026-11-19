@@ -41,16 +41,7 @@ struct MachineDetailView: View {
                     ConnectivityBadge(connectivity: connectivity)
                 }
                 .padding(.vertical, 4)
-                if case .offline(let message) = connectivity {
-                    Banner(symbol: "bolt.horizontal.circle.fill", tint: .red, text: message)
-                }
-                if let facts, facts.dockerVersion?.isEmpty ?? false {
-                    Banner(symbol: "shippingbox", tint: .orange, text: "Docker is not installed (or not reachable with the configured privileges).", actionTitle: "Install Docker…") {
-                        confirmDocker = true
-                    }
-                } else if let facts, facts.dockerVersion?.isEmpty == false, facts.composeVersion?.isEmpty ?? true {
-                    Banner(symbol: "shippingbox", tint: .orange, text: "Docker is installed but the Compose plugin is missing. Install the docker-compose-plugin package.")
-                }
+                banners(machine, connectivity: connectivity)
             }
 
             if let sample {
@@ -63,6 +54,19 @@ struct MachineDetailView: View {
                             .frame(height: 120)
                             .padding(.vertical, 4)
                     }
+                }
+            }
+
+            let external = model.unmanagedProjects(on: machine.id)
+            if !external.isEmpty {
+                Section {
+                    ForEach(external) { project in
+                        ExternalProjectRow(project: project, machineID: machine.id)
+                    }
+                } header: {
+                    Text("Other Buildbarn Deployments")
+                } footer: {
+                    Text("Started outside BB Manager. Take Over reads its settings from the running containers, stops it, and redeploys it as a BB Manager main node and worker with the same ports, instance name and platform. Its folder is kept, and if anything fails it is started again.")
                 }
             }
 
@@ -191,6 +195,93 @@ struct MachineDetailView: View {
         guard let value, !value.isEmpty else { return nil }
         return value
     }
+
+    /// At most one banner, most actionable first.
+    @ViewBuilder
+    private func banners(_ machine: Machine, connectivity: Connectivity) -> some View {
+        let facts = machine.facts
+        let user = machine.user.isEmpty ? "This user" : machine.user
+        if case .offline(let message) = connectivity {
+            Banner(symbol: "bolt.horizontal.circle.fill", tint: .red, text: message)
+        } else if let facts, facts.shouldUseDockerGroup, machine.privilege != .none {
+            let newDirectory = model.roles(on: machine.id).contains { model.deployedAt($0) != nil }
+                ? nil : facts.dockerGroupInstallDirectory(current: machine.installDirectory)
+            Banner(
+                symbol: "person.badge.key.fill",
+                tint: .orange,
+                text: "sudo needs a password here, but \(user) can use Docker directly (docker group)."
+                    + (newDirectory.map { " BB Manager will install into \($0) because \(machine.installDirectory) needs root." } ?? ""),
+                actionTitle: "Use Docker Without sudo"
+            ) {
+                model.useDockerGroup(machine.id)
+            }
+        } else if case .limited(let message) = connectivity {
+            Banner(symbol: "lock.trianglebadge.exclamationmark.fill", tint: .orange, text: message, actionTitle: "Edit…") {
+                model.sheet = .editMachine(machine.id)
+            }
+        } else if let error = facts?.privilegeError {
+            Banner(symbol: "lock.trianglebadge.exclamationmark.fill", tint: .orange, text: "Privileged commands failed: \(error)", actionTitle: "Edit…") {
+                model.sheet = .editMachine(machine.id)
+            }
+        } else if let facts, facts.dockerVersion?.isEmpty ?? false {
+            Banner(symbol: "shippingbox", tint: .orange, text: "Docker is not installed.", actionTitle: "Install Docker…") {
+                confirmDocker = true
+            }
+        } else if let facts, facts.dockerVersion?.isEmpty == false, facts.composeVersion?.isEmpty ?? true {
+            Banner(symbol: "shippingbox", tint: .orange, text: "Docker is installed but the Compose plugin is missing. Install the docker-compose-plugin package.")
+        }
+    }
+}
+
+struct ExternalProjectRow: View {
+    @Environment(AppModel.self) private var model
+    var project: ComposeProject
+    var machineID: UUID
+
+    var body: some View {
+        let blocker = model.takeOverBlocker(on: machineID)
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Image(systemName: "shippingbox")
+                    .foregroundStyle(.secondary)
+                Text(project.name).fontWeight(.medium)
+                Text("\(project.runningCount) of \(project.containers.count) running")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                Spacer()
+                Button {
+                    model.takeOver(project, on: machineID)
+                } label: {
+                    Label("Take Over", systemImage: "arrow.down.to.line.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(blocker != nil)
+                .help(blocker ?? "Make \(project.name) a BB Manager–managed main node and worker")
+            }
+            Text(project.workingDirectory)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            services
+                .font(.callout)
+            if !project.hostPorts.isEmpty {
+                Text("Ports: " + project.hostPorts.sorted().map(String.init).joined(separator: ", "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// Service names with a status dot each; wraps like text.
+    private var services: Text {
+        project.containers.enumerated().reduce(Text("")) { text, item in
+            let container = item.element
+            let color: Color = container.isRunning ? .green : (container.service.contains("installer") ? .secondary : .red)
+            let dot = Text(Image(systemName: "circle.fill")).font(.system(size: 7)).foregroundStyle(color)
+            return text + (item.offset == 0 ? Text("") : Text("    ")) + dot + Text(" " + container.service)
+        }
+    }
 }
 
 struct UsageRow: View {
@@ -269,7 +360,7 @@ struct MachineEditorSheet: View {
     enum TestState {
         case idle
         case testing
-        case success(MachineFacts, warning: String?)
+        case success(MachineFacts, note: String?, warning: String?)
         case failure(String)
     }
 
@@ -373,7 +464,7 @@ struct MachineEditorSheet: View {
             } icon: {
                 Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
             }
-        case .success(let facts, let warning):
+        case .success(let facts, let note, let warning):
             VStack(alignment: .leading, spacing: 6) {
                 Label("Connected to \(facts.osName ?? "machine")", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
@@ -381,8 +472,11 @@ struct MachineEditorSheet: View {
                     .foregroundStyle(.secondary)
                 if let docker = facts.dockerVersion, !docker.isEmpty {
                     Text("Docker \(docker) · Compose \(facts.composeVersion ?? "missing")").foregroundStyle(.secondary)
-                } else {
+                } else if facts.privilegeError == nil {
                     Text("Docker not found — you can install it from the machine's page after adding it.").foregroundStyle(.orange)
+                }
+                if let note {
+                    Label(note, systemImage: "info.circle.fill").foregroundStyle(.blue)
                 }
                 if let warning {
                     Label(warning, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -427,22 +521,28 @@ struct MachineEditorSheet: View {
         model.ssh.closeMaster(machine)
         Task {
             do {
-                let preflight = try await model.ssh.runChecked(machine, script: RemoteScripts.preflight(installDirectory: machine.installDirectory), timeout: 30)
+                var facts = try await model.inspect(machine)
+                var note: String?
                 var warning: String?
-                var dockerOutput: String?
-                do {
-                    dockerOutput = try await model.ssh.run(machine, script: RemoteScripts.dockerCheck, privileged: true, timeout: 30).stdout
-                } catch {
-                    warning = "Privileged commands failed: \(error.localizedDescription)"
-                }
-                let facts = RemoteScripts.facts(preflight: preflight.stdout, docker: dockerOutput)
                 if facts.isRoot == true && draft.privilege != .none {
                     draft.privilege = .none
-                } else if facts.isRoot == false && facts.passwordlessSudo == false && draft.privilege == .sudo && warning == nil {
+                    facts = try await model.inspect(normalizedDraft())
+                } else if facts.shouldUseDockerGroup && draft.privilege != .none {
+                    // sudo wants a password but Docker works for this user: use the docker group.
+                    draft.facts = facts
+                    let previousDirectory = draft.installDirectory
+                    draft.adoptDockerGroup()
+                    note = "sudo needs a password here, but this user is in the docker group, so BB Manager will run Docker without sudo"
+                        + (draft.installDirectory != previousDirectory ? " and install into \(draft.installDirectory)." : ".")
+                    facts = try await model.inspect(normalizedDraft())
+                }
+                if let error = facts.privilegeError {
+                    warning = "Privileged commands failed: \(error)"
+                } else if facts.isRoot == false && facts.passwordlessSudo == false && draft.privilege == .sudo {
                     warning = "Passwordless sudo is not available. Choose “sudo with password” or add the user to the docker group."
                 }
                 draft.facts = facts
-                testState = .success(facts, warning: warning)
+                testState = .success(facts, note: note, warning: warning)
             } catch {
                 testState = .failure(error.localizedDescription)
             }

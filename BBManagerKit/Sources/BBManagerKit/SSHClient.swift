@@ -333,13 +333,18 @@ public final class SSHClient: @unchecked Sendable {
     static func sudoError(in text: String, privilege: PrivilegeMode?) -> SSHError? {
         guard let privilege, privilege != .none else { return nil }
         let lower = text.lowercased()
-        if lower.contains("sudo: a password is required") || lower.contains("sudo: a terminal is required") {
+        // Classic sudo and sudo-rs (the default since Ubuntu 25.10) word these differently.
+        if lower.contains("sudo: a password is required")
+            || lower.contains("sudo: a terminal is required")
+            || lower.contains("sudo: interactive authentication is required") {
             return .sudoPasswordRequired
         }
-        if lower.contains("incorrect password") || lower.contains("sorry, try again") {
+        if lower.contains("incorrect password") || lower.contains("sorry, try again")
+            || lower.contains("authentication failed") || lower.contains("incorrect authentication attempt") {
             return .sudoFailed("The stored password was rejected.")
         }
-        if lower.contains("is not in the sudoers file") || lower.contains("not allowed to execute") {
+        if lower.contains("is not in the sudoers file") || lower.contains("not allowed to execute")
+            || lower.contains("i'm afraid i can't do that") {
             return .sudoFailed("This user is not allowed to use sudo.")
         }
         return nil

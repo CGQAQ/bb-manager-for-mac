@@ -23,8 +23,11 @@ public enum RemoteScripts {
         if [ -e /dev/fuse ]; then echo fuse=1; else echo fuse=0; fi
         if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then echo http=1; else echo http=0; fi
         if [ "$(id -u)" = 0 ] || sudo -n true >/dev/null 2>&1; then echo sudo_nopasswd=1; else echo sudo_nopasswd=0; fi
+        if docker info >/dev/null 2>&1; then echo docker_user=1; else echo docker_user=0; fi
+        echo "home=$HOME"
         d=\(Shell.quote(installDirectory))
         while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+        if [ -w "$d" ]; then echo install_writable=1; else echo install_writable=0; fi
         df -Pk "$d" 2>/dev/null | awk 'NR==2 {print "disk_total_kb="$2; print "disk_avail_kb="$4}'
         """
     }
@@ -59,6 +62,9 @@ public enum RemoteScripts {
         facts.hasHTTPClient = kv["http"].map { $0 == "1" }
         facts.isRoot = kv["uid"].map { $0 == "0" }
         facts.passwordlessSudo = kv["sudo_nopasswd"].map { $0 == "1" }
+        facts.dockerWithoutSudo = kv["docker_user"].map { $0 == "1" }
+        facts.installDirectoryWritable = kv["install_writable"].map { $0 == "1" }
+        facts.homeDirectory = kv["home"].flatMap { $0.isEmpty ? nil : $0 }
         facts.diskTotalBytes = kv["disk_total_kb"].flatMap { Int64($0) }.map { $0 * 1024 }
         facts.diskAvailableBytes = kv["disk_avail_kb"].flatMap { Int64($0) }.map { $0 * 1024 }
         if docker != nil {
@@ -248,6 +254,8 @@ public enum RemoteScripts {
         while [ ! -d "$d" ]; do d=$(dirname "$d"); done
         df -Pk "$d" 2>/dev/null | awk 'NR==2'
         echo '@@dockerstats'; docker stats --no-stream --format '{{json .}}' 2>/dev/null
+        echo '@@projects'
+        docker ps -a --filter label=com.docker.compose.project --format \(Shell.quote(ComposeProject.psFormat)) 2>/dev/null
 
         """
         for node in nodes {

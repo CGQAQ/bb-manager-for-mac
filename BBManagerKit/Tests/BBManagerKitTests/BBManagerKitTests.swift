@@ -55,6 +55,36 @@ import Testing
     @Test func mapsSudoErrors() {
         #expect(SSHClient.sudoError(in: "sudo: a password is required", privilege: .sudo) == .sudoPasswordRequired)
         #expect(SSHClient.sudoError(in: "sudo: a password is required", privilege: PrivilegeMode.none) == nil)
+        // sudo-rs, the default sudo on Ubuntu 25.10 and later.
+        #expect(SSHClient.sudoError(in: "sudo: interactive authentication is required", privilege: .sudo) == .sudoPasswordRequired)
+        #expect(SSHClient.sudoError(in: "sudo: Authentication failed, try again.", privilege: .sudoWithPassword) == .sudoFailed("The stored password was rejected."))
+        #expect(SSHClient.sudoError(in: "I'm sorry cg. I'm afraid I can't do that", privilege: .sudo) == .sudoFailed("This user is not allowed to use sudo."))
+    }
+
+    @Test func checkTransportErrorsReportsSudoRs() {
+        let result = SSHResult(exitCode: 1, stdout: "", stderr: "sudo: interactive authentication is required\n")
+        #expect(throws: SSHError.sudoPasswordRequired) {
+            try SSHClient.checkTransportErrors(result, privileged: .sudo, host: "h")
+        }
+    }
+
+    @Test func adoptsDockerGroup() {
+        var facts = MachineFacts()
+        facts.isRoot = false
+        facts.passwordlessSudo = false
+        facts.dockerWithoutSudo = true
+        facts.installDirectoryWritable = false
+        facts.homeDirectory = "/home/builder"
+        #expect(facts.shouldUseDockerGroup)
+        var machine = Machine(host: "h", privilege: .sudo, facts: facts)
+        machine.adoptDockerGroup()
+        #expect(machine.privilege == PrivilegeMode.none)
+        #expect(machine.installDirectory == "/home/builder/buildbarn")
+
+        facts.installDirectoryWritable = true
+        var writable = Machine(host: "h", privilege: .sudo, installDirectory: "/srv/bb", facts: facts)
+        writable.adoptDockerGroup()
+        #expect(writable.installDirectory == "/srv/bb")
     }
 }
 
@@ -164,6 +194,102 @@ import Testing
         #expect(output.metrics(nodeKey: "main", service: "frontend")?.sum("go_goroutines") == 12)
     }
 
+    @Test func discoversExistingBuildbarnProjects() throws {
+        // Output captured from a real machine running a hand-made deployment.
+        let text = """
+        @@projects
+        buildbarn-legacy|/home/builder/buildbarn-legacy|runner|ghcr.io/catthehacker/ubuntu:act-22.04|running|
+        buildbarn-legacy|/home/builder/buildbarn-legacy|frontend|ghcr.io/buildbarn/bb-storage:20261102T091443Z-ca3d8b4|running|0.0.0.0:8980->8980/tcp, [::]:8980->8980/tcp
+        buildbarn-legacy|/home/builder/buildbarn-legacy|scheduler|ghcr.io/buildbarn/bb-scheduler:20261102T094740Z-c9ba98c|running|0.0.0.0:8983->8983/tcp, [::]:8983->8983/tcp
+        buildbarn-legacy|/home/builder/buildbarn-legacy|runner-installer|ghcr.io/buildbarn/bb-runner-installer:20261102T094740Z-c9ba98c|exited|
+        website|/srv/site|web|nginx:latest|running|0.0.0.0:80->80/tcp
+        """
+        let projects = try #require(PollOutput(text).buildbarnProjects)
+        #expect(projects.map(\.name) == ["buildbarn-legacy"])
+        let project = try #require(projects.first)
+        #expect(project.workingDirectory == "/home/builder/buildbarn-legacy")
+        #expect(project.containers.count == 4)
+        #expect(project.runningCount == 3)
+        #expect(project.hostPorts == [8980, 8983])
+        #expect(ComposeProject.hostPorts(in: "127.0.0.1:9000-9002->9000-9002/tcp, 8981/tcp") == [9000, 9001, 9002])
+        #expect(PollOutput("@@loadavg\n1 1 1").buildbarnProjects == nil)
+    }
+
+    @Test func surveysExistingDeploymentIntoSettings() throws {
+        // Shaped like the survey of a real hand-made deployment.
+        let output = #"""
+        @@containers
+        frontend|ghcr.io/buildbarn/bb-storage:S|false|true|8980/tcp=8980;|172.18.0.5
+        storage|ghcr.io/buildbarn/bb-storage:S|false|true||172.18.0.3
+        scheduler|ghcr.io/buildbarn/bb-scheduler:R|false|true|8983/tcp=8983;|172.18.0.4
+        worker|ghcr.io/buildbarn/bb-worker:R|true|true||172.18.0.2
+        runner|ghcr.io/catthehacker/ubuntu:act-22.04@sha256:abc|false|true||
+        runner-installer|ghcr.io/buildbarn/bb-runner-installer:R|false|false||
+        @@files
+        storage|/storage-cs|blocks|322122547200
+        storage|/storage-cs|persistent_state|0
+        storage|/storage-ac|blocks|2147483648
+        storage|/storage-cms|blocks|2147483648
+        storage|/storage-fsac|blocks|536870912
+        worker|/worker|cs/blocks|34359738368
+        worker|/worker|filepool|34359738368
+        @@usage
+        8074340	/home/builder/buildbarn-legacy/volumes/storage-cs
+        1992300	/home/builder/buildbarn-legacy/volumes/worker
+        @@scheduler
+        buildbarn_builder_in_memory_build_queue_workers_created_total{instance_name_prefix="team",platform="{\"properties\":[{\"name\":\"pool\",\"value\":\"default\"}]}",size_class="0"} 50
+        buildbarn_builder_in_memory_build_queue_workers_removed_total{instance_name_prefix="team",platform="{\"properties\":[{\"name\":\"pool\",\"value\":\"default\"}]}",size_class="0",state="Idle"} 6
+        """#
+        let machine = Machine(name: "main", host: "10.0.0.5", user: "builder", privilege: PrivilegeMode.none, installDirectory: "/home/builder/buildbarn")
+        let project = ComposeProject(name: "buildbarn-legacy", workingDirectory: "/home/builder/buildbarn-legacy",
+                                     composeFiles: ["/home/builder/buildbarn-legacy/docker-compose.yml"], containers: [])
+        let plan = TakeoverSurvey.plan(output: output, project: project, machine: machine, existing: ClusterConfiguration())
+
+        #expect(plan.warnings.isEmpty)
+        #expect(plan.images.storage == "ghcr.io/buildbarn/bb-storage:S")
+        #expect(plan.images.scheduler == "ghcr.io/buildbarn/bb-scheduler:R")
+        #expect(plan.main.advertisedAddress == "10.0.0.5")
+        #expect(plan.main.frontendPort == 8980)
+        #expect(plan.main.schedulerWorkerPort == 8983)
+        #expect(plan.main.storage.shards == 1)
+        #expect(plan.main.storage.casSizeGiB == 300)
+        #expect(plan.main.storage.actionCacheSizeMiB == 2048)
+        #expect(plan.main.storage.fileSystemAccessCacheSizeMiB == 512)
+        #expect(plan.main.storage.persistent)
+        #expect(plan.main.portal.enabled == false)
+        #expect(plan.cacheBytes == (8074340 + 1992300) * 1024)
+
+        let worker = try #require(plan.worker)
+        #expect(worker.kind == .fuse)
+        #expect(worker.concurrency == 32)  // from the scratch file, not the 44 scheduler slots
+        #expect(worker.filePoolPerActionGiB == 1)
+        #expect(worker.localCacheSizeGiB == 32)
+        #expect(worker.instanceNamePrefix == "team")
+        #expect(worker.runnerImage == "ghcr.io/catthehacker/ubuntu:act-22.04@sha256:abc")
+        // The platform must stay exactly {pool=default}: no container-image added.
+        #expect(worker.effectivePlatformProperties.map { "\($0.name)=\($0.value)" } == ["pool=default"])
+        #expect(plan.findings.contains { $0.contains("12 more executor slots") })
+
+        // Generated configs carry the imported values.
+        var cluster = ClusterConfiguration()
+        cluster.main = plan.main
+        cluster.workers = [WorkerNode(machineID: machine.id, settings: worker)]
+        let generator = ConfigGenerator(cluster: cluster, machines: [machine])
+        let workerConfig = try #require(generator.workerPlan(cluster.workers[0])?.files.first { $0.path == "config/worker.jsonnet" }).content
+        #expect(workerConfig.contains("instanceNamePrefix: 'team',"))
+        #expect(workerConfig.contains("{ name: 'pool', value: 'default' },"))
+        #expect(!workerConfig.contains("container-image"))
+        #expect(workerConfig.contains("concurrency: 32,"))
+
+        let stop = TakeoverSurvey.stopScript(plan)
+        #expect(stop.contains("set -- -p 'buildbarn-legacy'"))
+        #expect(stop.contains("-f '/home/builder/buildbarn-legacy/docker-compose.yml'"))
+        #expect(stop.contains("$DC \"$@\" down"))
+        let rollback = TakeoverSurvey.rollbackScript(plan, newDirectories: ["/home/builder/buildbarn/main"])
+        #expect(rollback.contains("(cd '/home/builder/buildbarn/main' && $DC down --remove-orphans)"))
+        #expect(rollback.contains("$DC \"$@\" up -d"))
+    }
+
     @Test func parsesComposeJSONArray() {
         let containers = ContainerStatus.parse(#"[{"Name":"a","Service":"b","State":"running","Status":"Up","Image":"i"}]"#)
         #expect(containers.count == 1)
@@ -180,6 +306,12 @@ import Testing
         #expect(facts.isRoot == false)
         #expect(facts.dockerReady)
         #expect(facts.diskAvailableBytes == 10240)
+
+        let more = RemoteScripts.facts(preflight: "uid=1000\nsudo_nopasswd=0\ndocker_user=1\ninstall_writable=0\nhome=/home/builder", docker: nil)
+        #expect(more.dockerWithoutSudo == true)
+        #expect(more.installDirectoryWritable == false)
+        #expect(more.homeDirectory == "/home/builder")
+        #expect(more.shouldUseDockerGroup)
     }
 }
 
@@ -205,6 +337,7 @@ import Testing
         #expect(plan.directory == "/opt/buildbarn/main")
         #expect(plan.files.map(\.path).contains("config/portal.jsonnet"))
         #expect(plan.services == ["frontend", "storage-0", "storage-1", "scheduler", "portal", "postgres"])
+        #expect(Set(plan.hostPorts).isSuperset(of: [8980, 8983, 8991, 8992, 8081, 8082, 9980]))
         let compose = try #require(plan.files.first { $0.path == "docker-compose.yml" }).content
         #expect(compose.contains("\"8992:8981\""))
         #expect(compose.contains("127.0.0.1:9991:9980"))

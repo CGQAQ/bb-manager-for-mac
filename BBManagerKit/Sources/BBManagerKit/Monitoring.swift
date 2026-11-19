@@ -40,6 +40,13 @@ public struct PollOutput: Sendable {
 
     public var dockerStats: [ContainerUsage] { ContainerUsage.parse(self["dockerstats"] ?? "") }
 
+    /// Buildbarn Compose projects running on the machine, including ones BB Manager didn't create.
+    /// Nil when the section is missing (for example an older script or no Docker access).
+    public var buildbarnProjects: [ComposeProject]? {
+        guard let text = self["projects"] else { return nil }
+        return ComposeProject.parse(text)
+    }
+
     public func containers(nodeKey: String) -> [ContainerStatus]? {
         guard let text = self["compose \(nodeKey)"] else { return nil }
         return ContainerStatus.parse(text)
@@ -194,6 +201,87 @@ public struct ContainerStatus: Identifiable, Hashable, Sendable, Decodable {
         return trimmed.split(separator: "\n")
             .compactMap { try? decoder.decode(ContainerStatus.self, from: Data($0.utf8)) }
             .sorted { $0.service < $1.service }
+    }
+}
+
+/// A Docker Compose project that runs Buildbarn images, found with `docker ps`.
+public struct ComposeProject: Identifiable, Hashable, Sendable {
+    public struct Container: Hashable, Sendable {
+        public var service: String
+        public var image: String
+        public var state: String
+        public var ports: String
+
+        public var isRunning: Bool { state.lowercased() == "running" }
+    }
+
+    public var name: String
+    public var workingDirectory: String
+    /// Compose files the project was started with (absolute paths).
+    public var composeFiles: [String] = []
+    public var containers: [Container]
+
+    public var id: String { name }
+
+    /// Fields separated by `|`: project, working dir, service, image, state, ports, compose files.
+    public static let psFormat = "{{.Label \"com.docker.compose.project\"}}|{{.Label \"com.docker.compose.project.working_dir\"}}|{{.Label \"com.docker.compose.service\"}}|{{.Image}}|{{.State}}|{{.Ports}}|{{.Label \"com.docker.compose.project.config_files\"}}"
+
+    public var runningCount: Int { containers.filter(\.isRunning).count }
+
+    /// Host ports published by the project's containers (any bind address).
+    public var hostPorts: Set<Int> {
+        Set(containers.flatMap { Self.hostPorts(in: $0.ports) })
+    }
+
+    /// Parses `docker ps` port strings such as `0.0.0.0:8980->8980/tcp, [::]:8980->8980/tcp`
+    /// or `0.0.0.0:9000-9002->9000-9002/tcp`. Exposed-only ports (`8981/tcp`) are ignored.
+    public static func hostPorts(in text: String) -> [Int] {
+        var ports: [Int] = []
+        let pattern = #/:(\d+)(?:-(\d+))?->/#
+        for match in text.matches(of: pattern) {
+            guard let start = Int(match.1) else { continue }
+            let end = match.2.flatMap { Int($0) } ?? start
+            if end >= start && end - start < 1000 {
+                ports.append(contentsOf: start...end)
+            }
+        }
+        return ports
+    }
+
+    /// Groups `docker ps` lines by project and keeps projects that run a Buildbarn image.
+    public static func parse(_ text: String) -> [ComposeProject] {
+        var order: [String] = []
+        var directories: [String: String] = [:]
+        var files: [String: [String]] = [:]
+        var containers: [String: [Container]] = [:]
+        for line in text.split(separator: "\n") {
+            let fields = line.split(separator: "|", maxSplits: 6, omittingEmptySubsequences: false).map(String.init)
+            guard fields.count >= 5, !fields[0].isEmpty else { continue }
+            let name = fields[0]
+            if containers[name] == nil {
+                order.append(name)
+                directories[name] = fields[1]
+            }
+            if fields.count > 6, files[name, default: []].isEmpty {
+                files[name] = fields[6].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            }
+            containers[name, default: []].append(Container(
+                service: fields[2],
+                image: fields[3],
+                state: fields[4],
+                ports: fields.count > 5 ? fields[5] : ""
+            ))
+        }
+        return order.compactMap { name in
+            let list = containers[name] ?? []
+            guard list.contains(where: { $0.image.contains("buildbarn/") }) else { return nil }
+            return ComposeProject(
+                name: name,
+                workingDirectory: directories[name] ?? "",
+                composeFiles: files[name] ?? [],
+                containers: list.sorted { $0.service < $1.service }
+            )
+        }
     }
 }
 

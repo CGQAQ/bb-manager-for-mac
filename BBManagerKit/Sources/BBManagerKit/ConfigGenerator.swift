@@ -33,6 +33,8 @@ public struct NodePlan: Sendable {
     public var diagnostics: [DiagnosticsEndpoint]
     /// Stop everything before starting again (needed for FUSE mounts).
     public var stopBeforeDeploy: Bool
+    /// Host ports the node publishes, on any address.
+    public var hostPorts: [Int] = []
 
     /// Stable hash of the effective file contents, used to detect undeployed changes.
     public var fingerprint: String {
@@ -116,6 +118,13 @@ public struct ConfigGenerator {
             diagnostics.append(DiagnosticsEndpoint(service: "portal", port: Self.portalDiagnosticsPort))
         }
 
+        var hostPorts = [main.frontendPort, main.schedulerWorkerPort, 8984]
+        hostPorts += (0..<shards).map { main.storageBasePort + $0 }
+        hostPorts += diagnostics.map(\.port)
+        if main.portal.enabled {
+            hostPorts += [main.portal.httpPort, main.portal.besPort]
+        }
+
         return NodePlan(
             role: .main,
             machine: machine,
@@ -124,7 +133,8 @@ public struct ConfigGenerator {
             prepareScript: mainPrepareScript(main, shards: shards),
             services: services,
             diagnostics: diagnostics,
-            stopBeforeDeploy: false
+            stopBeforeDeploy: false,
+            hostPorts: hostPorts.sorted()
         )
     }
 
@@ -631,7 +641,8 @@ public struct ConfigGenerator {
             prepareScript: workerPrepareScript(settings),
             services: ["worker", "runner"],
             diagnostics: [DiagnosticsEndpoint(service: "worker", port: Self.workerDiagnosticsPort)],
-            stopBeforeDeploy: true
+            stopBeforeDeploy: true,
+            hostPorts: [Self.workerDiagnosticsPort]
         )
     }
 

@@ -27,6 +27,26 @@ xcodebuild -project BBManager.xcodeproj -scheme BBManager -configuration Release
 open "build/DerivedData/Build/Products/Release/BB Manager.app"
 ```
 
+### Package as a DMG
+
+```bash
+scripts/build-dmg.sh
+```
+
+This builds a universal (Apple silicon and Intel) Release app and writes `dist/BB-Manager-<version>.dmg`, which contains the app and an Applications shortcut for drag-to-install. The build log goes to `build/build-dmg.log`.
+
+By default the app is signed ad hoc. It runs on the Mac that built it. On other Macs, Gatekeeper blocks the first launch: right-click the app and choose **Open**, or allow it under System Settings > Privacy & Security. To distribute it properly, sign with a Developer ID certificate and notarize:
+
+```bash
+xcrun notarytool store-credentials bbmanager-notary
+```
+
+```bash
+SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" NOTARY_PROFILE=bbmanager-notary scripts/build-dmg.sh
+```
+
+### Tests
+
 The core library has its own tests:
 
 ```bash
@@ -90,6 +110,7 @@ BBManagerKit/              Swift package with the UI-independent core
   RemoteScripts.swift      Preflight, deploy, compose, logs, uninstall, poll
   Prometheus.swift         Prometheus text-format parser
   Monitoring.swift         Poll output, host stats, Buildbarn metric summaries
+scripts/build-dmg.sh       Builds the Release app and packages it as a DMG
 scripts/make-icon.swift    Regenerates the app icon
 ```
 

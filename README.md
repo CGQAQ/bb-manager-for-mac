@@ -45,6 +45,28 @@ xcrun notarytool store-credentials bbmanager-notary
 SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" NOTARY_PROFILE=bbmanager-notary scripts/build-dmg.sh
 ```
 
+`VERSION`, `BUILD_NUMBER` and `DMG_NAME` override the version, build number and file name.
+
+### Releases on GitHub
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs whenever a GitHub release is published. On a `macos-26` runner it runs the tests, builds the DMG, and attaches `BB-Manager-<tag>.dmg` and its `.sha256` checksum to the release.
+
+To release, publish a release in the GitHub web UI (Releases > Draft a new release), or use the CLI:
+
+```bash
+gh release create v1.0.0 --generate-notes
+```
+
+- A tag such as `v1.2.3` sets the app version to 1.2.3. The build number is the workflow run number. A suffix like `v1.3.0-beta.1` stays in the file name, but the app version is 1.3.0.
+- **Actions > Release > Run workflow** rebuilds the DMG for an existing tag and replaces the attached files. Leave the tag empty for a dry run: the DMG is kept only as a workflow artifact.
+- Without extra secrets, the DMG is signed ad hoc, the same as a local build. To ship a Developer ID signed and notarized DMG, add these repository secrets:
+
+| Secret | Value |
+|--------|-------|
+| `MACOS_CERTIFICATE_P12` | Base64 of your "Developer ID Application" certificate exported as .p12 (`base64 -i cert.p12 \| pbcopy`) |
+| `MACOS_CERTIFICATE_PASSWORD` | Password of that .p12 |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | Apple ID, team ID and an [app-specific password](https://support.apple.com/102654) for notarization |
+
 ### Tests
 
 The core library has its own tests:
@@ -111,6 +133,7 @@ BBManagerKit/              Swift package with the UI-independent core
   Prometheus.swift         Prometheus text-format parser
   Monitoring.swift         Poll output, host stats, Buildbarn metric summaries
 scripts/build-dmg.sh       Builds the Release app and packages it as a DMG
+.github/workflows/         Release workflow that attaches the DMG to GitHub releases
 scripts/make-icon.swift    Regenerates the app icon
 ```
 

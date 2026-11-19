@@ -146,29 +146,42 @@ public final class SSHClient: @unchecked Sendable {
         return env
     }
 
-    private func makeProcess(_ machine: Machine, script: String, privileged: Bool) throws -> (Process, Data?) {
+    private func makeProcess(_ machine: Machine, script: String, privileged: Bool) throws -> (Process, Data) {
         let options = self.options
         let privilege: PrivilegeMode? = privileged ? machine.privilege : nil
-        let command = Shell.remoteCommand(script: script, privilege: privilege)
-        guard command.utf8.count < 120_000 else { throw SSHError.scriptTooLarge }
+        // The remote side passes the script to `sh -c` as one argument; Linux caps that at 128 KiB.
+        guard script.utf8.count < 120_000 else { throw SSHError.scriptTooLarge }
 
-        var stdinData: Data?
+        var password: String?
         if privilege == .sudoWithPassword {
-            guard let password = passwordProvider(machine.keychainAccount), !password.isEmpty else {
+            guard let stored = passwordProvider(machine.keychainAccount), !stored.isEmpty else {
                 throw SSHError.passwordMissing
             }
-            stdinData = Data((password + "\n").utf8)
+            password = stored
         }
         if machine.auth == .password, passwordProvider(machine.keychainAccount)?.isEmpty ?? true {
             throw SSHError.passwordMissing
         }
+        let invocation = Shell.remoteInvocation(script: script, privilege: privilege, password: password)
 
         prepareControlDirectory()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: options.sshPath)
-        process.arguments = arguments(for: machine, remoteCommand: command, options: options)
+        process.arguments = arguments(for: machine, remoteCommand: invocation.command, options: options)
         process.environment = environment(for: machine, options: options)
-        return (process, stdinData)
+        return (process, invocation.input)
+    }
+
+    /// Writes the script to ssh's standard input and closes it.
+    ///
+    /// Runs off the caller's thread: a script larger than the pipe buffer blocks the
+    /// write until ssh has connected and started reading.
+    private static func feed(_ pipe: Pipe, _ data: Data) {
+        let handle = pipe.fileHandleForWriting
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        }
     }
 
     // MARK: Running
@@ -219,10 +232,7 @@ public final class SSHClient: @unchecked Sendable {
                     collector.fail(SSHError.launchFailed(error.localizedDescription))
                     return
                 }
-                if let stdinData {
-                    try? inPipe.fileHandleForWriting.write(contentsOf: stdinData)
-                }
-                try? inPipe.fileHandleForWriting.close()
+                Self.feed(inPipe, stdinData)
                 DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
                     if process.isRunning {
                         collector.markTimedOut(Int(timeout))
@@ -255,7 +265,7 @@ public final class SSHClient: @unchecked Sendable {
     public func stream(_ machine: Machine, script: String, privileged: Bool = false) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let process: Process
-            let stdinData: Data?
+            let stdinData: Data
             do {
                 (process, stdinData) = try makeProcess(machine, script: script, privileged: privileged)
             } catch {
@@ -308,10 +318,7 @@ public final class SSHClient: @unchecked Sendable {
                 continuation.finish(throwing: SSHError.launchFailed(error.localizedDescription))
                 return
             }
-            if let stdinData {
-                try? inPipe.fileHandleForWriting.write(contentsOf: stdinData)
-            }
-            try? inPipe.fileHandleForWriting.close()
+            Self.feed(inPipe, stdinData)
         }
     }
 

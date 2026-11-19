@@ -638,7 +638,7 @@ public struct ConfigGenerator {
 
     public func workerPlan(_ worker: WorkerNode) -> NodePlan? {
         guard let main = cluster.main, let machine = machine(worker.machineID) else { return nil }
-        if worker.settings.kind == .native {
+        if worker.settings.kind.isNative {
             return nativeWorkerPlan(worker, main: main, machine: machine)
         }
         let shards = max(1, main.storage.shards)
@@ -923,20 +923,23 @@ public struct ConfigGenerator {
         let files: [(String, String)] = [
             ("config/common.libsonnet", common(main, diagnosticsAddress: "127.0.0.1:\(Self.workerDiagnosticsPort)")),
             ("config/topology.libsonnet", topology(storageAddresses: externalStorage)),
-            ("config/worker.jsonnet", nativeWorker(s, main: main, machine: machine, directory: directory)),
+            ("config/worker.jsonnet", s.kind == .nativeNFSv4
+                ? nfsWorker(s, main: main, machine: machine, directory: directory)
+                : nativeWorker(s, main: main, machine: machine, directory: directory)),
             ("config/runner.jsonnet", nativeRunner(directory: directory)),
-            ("launchd/\(LaunchdScripts.label("runner")).plist", launchAgent(service: "runner", binary: "bb_runner", directory: directory)),
-            ("launchd/\(LaunchdScripts.label("worker")).plist", launchAgent(service: "worker", binary: "bb_worker", directory: directory)),
+            ("launchd/\(LaunchdScripts.label("runner")).plist", launchDaemon(service: "runner", binary: "bb_runner", directory: directory, asOwner: true)),
+            ("launchd/\(LaunchdScripts.label("worker")).plist", launchDaemon(service: "worker", binary: "bb_worker", directory: directory, asOwner: false)),
         ]
-        let layout = Self.shortHash("native|\(s.localCacheSizeGiB)|\(s.maximumCacheFileCount)")
+        let layout = Self.shortHash("\(s.kind.rawValue)|\(s.localCacheSizeGiB)|\(s.maximumCacheFileCount)")
         let prepare = """
+        \(Self.unmountBuildDirectory(directory))
         LAYOUT='\(layout)'
         if [ "$(cat .cache-layout 2>/dev/null)" != "$LAYOUT" ]; then
-          rm -rf cache
+          rm -rf cache cs filepool
         fi
-        rm -rf build runner.sock
-        mkdir -p build cache logs
-        chmod 0700 cache
+        rm -rf build runner.sock nfsv4.sock
+        mkdir -p build cache cs/persistent_state logs
+        chmod 0700 cache cs
         printf '%s' "$LAYOUT" > .cache-layout
 
         """
@@ -953,6 +956,120 @@ public struct ConfigGenerator {
             runtime: .launchd,
             nativeRelease: NativeRelease(tag: workerReleaseTag ?? "", binaries: ["bb_worker", "bb_runner"])
         )
+    }
+
+    /// Shell that makes sure no NFSv4 mount is left on the build directory before it is
+    /// deleted: removing files through a live mount would hit the virtual file system.
+    public static func unmountBuildDirectory(_ directory: String) -> String {
+        // mount(8) lists resolved paths (/tmp is /private/tmp), so resolve symlinks first.
+        return """
+        BUILD_DIR="$(cd \(Shell.quote(directory)) 2>/dev/null && pwd -P)/build"
+        if mount | grep -qF " on $BUILD_DIR ("; then
+          echo "    Unmounting the NFSv4 build directory"
+          umount "$BUILD_DIR" 2>/dev/null || umount -f "$BUILD_DIR" 2>/dev/null || diskutil unmount force "$BUILD_DIR" >/dev/null 2>&1 || true
+        fi
+        if mount | grep -qF " on $BUILD_DIR ("; then
+          echo "error: $BUILD_DIR is still mounted. Unmount it with umount -f and try again."
+          exit 1
+        fi
+        """
+    }
+
+    /// Path of the Unix socket the macOS kernel connects to when mounting the NFSv4 server.
+    /// It must be absolute; macOS caps socket paths at 104 bytes.
+    public static func nfsSocketPath(_ directory: String) -> String { directory + "/nfsv4.sock" }
+
+    func nfsWorker(_ s: WorkerSettings, main: MainNodeSettings, machine: Machine, directory: String) -> String {
+        let concurrency = max(1, s.concurrency)
+        let cacheBytes = Self.bytes(gib: max(1, s.localCacheSizeGiB))
+        let perAction = Self.bytes(gib: max(0.125, s.filePoolPerActionGiB))
+        let localCache = Self.localBlobstore(
+            directory: directory + "/cs",
+            blocksBytes: cacheBytes,
+            keyLocationMapBytes: Self.keyLocationMapBytes(blocks: cacheBytes, ratio: 80),
+            newBlocks: 3,
+            persistent: true,
+            extra: nil
+        )
+        return """
+        // \(Self.header)
+        local common = import 'common.libsonnet';
+        local topology = import 'topology.libsonnet';
+
+        local cache = {
+          cacheSize: 10000,
+          cacheDuration: '60s',
+          cacheReplacementPolicy: 'LEAST_RECENTLY_USED',
+        };
+
+        {
+          blobstore: {
+            actionCache: topology.actionCache,
+            contentAddressableStorage: {
+              chunkStorage: {
+                readCaching: {
+                  slow: topology.chunkStorage,
+                  fast: \(Self.indent(localCache, 10)),
+                  replicator: { deduplicating: { 'local': {} } },
+                },
+              },
+              chunkMappingStorage: topology.chunkMappingStorage,
+              chunkMappingCache: cache,
+              cdcParameterCache: topology.cdcParameterCache,
+              chunkCache: cache,
+            },
+          },
+          portalUrl: common.portalUrl,
+          maximumMessageSizeBytes: common.maximumMessageSizeBytes,
+          scheduler: { address: \(js("\(main.advertisedAddress):\(main.schedulerWorkerPort)")) },
+          global: common.global,
+          buildDirectories: [{
+            virtual: {
+              maximumExecutionTimeoutCompensation: '3600s',
+              shuffleDirectoryListings: true,
+              maximumWritableFileUploadDelay: '60s',
+              mount: {
+                mountPath: \(js(directory + "/build")),
+                nfsv4: {
+                  darwin: { socketPath: \(js(Self.nfsSocketPath(directory))) },
+                  enforcedLeaseTime: '120s',
+                  announcedLeaseTime: '60s',
+                },
+              },
+            },
+            runners: [{
+              endpoint: { address: 'unix:runner.sock' },
+              concurrency: \(concurrency),
+              instanceNamePrefix: \(js(s.instanceNamePrefix)),
+        \(Self.indent(platformBlock(s), 6, includeFirstLine: true))
+              maximumFilePoolFileCount: 100000,
+              maximumFilePoolSizeBytes: \(Self.sizeExpression(perAction)),
+        \(Self.indent(workerID(machine), 6, includeFirstLine: true))
+            }],
+          }],
+          filePool: {
+            blockDevice: {
+              file: {
+                path: \(js(directory + "/filepool")),
+                sizeBytes: \(Self.sizeExpression(perAction * Int64(concurrency))),
+              },
+            },
+          },
+          inputDownloadConcurrency: \(max(1, s.inputDownloadConcurrency)),
+          outputUploadConcurrency: \(max(1, s.outputUploadConcurrency)),
+          directoryCache: {
+            maximumCount: 1000,
+            maximumSizeBytes: 1000 * 1024,
+            cacheReplacementPolicy: 'LEAST_RECENTLY_USED',
+          },
+          prefetching: {
+            fileSystemAccessCache: topology.fileSystemAccessCache,
+            bloomFilterBitsPerPath: 14,
+            bloomFilterMaximumSizeBytes: 65536,
+          },
+        }
+
+        """
     }
 
     func nativeWorker(_ s: WorkerSettings, main: MainNodeSettings, machine: Machine, directory: String) -> String {
@@ -1019,20 +1136,39 @@ public struct ConfigGenerator {
         """
     }
 
-    func launchAgent(service: String, binary: String, directory: String) -> String {
+    /// A launchd daemon property list for /Library/LaunchDaemons.
+    ///
+    /// bb_runner, which runs the build actions, runs as the SSH user (`asOwner`).
+    /// bb_worker runs as root: it is the process that talks to the scheduler and
+    /// storage, and macOS Local Network privacy blocks daemons that set `UserName`
+    /// ("no route to host") while exempting root daemons (Apple TN3179). Its umask of
+    /// 002 makes the build directories it creates writable by the runner: they inherit
+    /// the install directory's group, which is the SSH user's primary group.
+    func launchDaemon(service: String, binary: String, directory: String, asOwner: Bool) -> String {
         func xml(_ value: String) -> String {
             value.replacingOccurrences(of: "&", with: "&amp;")
                 .replacingOccurrences(of: "<", with: "&lt;")
                 .replacingOccurrences(of: ">", with: "&gt;")
         }
+        let identity = asOwner ? """
+          <key>UserName</key>
+          <string>\(LaunchdScripts.userPlaceholder)</string>
+          <key>GroupName</key>
+          <string>\(LaunchdScripts.groupPlaceholder)</string>
+        """ : """
+          <key>Umask</key>
+          <integer>2</integer>
+        """
         return """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <!-- \(Self.header) -->
+        <!-- Installed into /Library/LaunchDaemons; the __BBM_*__ placeholders are filled in with the SSH user at install time. -->
         <plist version="1.0">
         <dict>
           <key>Label</key>
           <string>\(LaunchdScripts.label(service))</string>
+        \(identity)
           <key>ProgramArguments</key>
           <array>
             <string>\(xml(directory))/bin/\(binary)</string>
@@ -1046,6 +1182,8 @@ public struct ConfigGenerator {
           <true/>
           <key>ThrottleInterval</key>
           <integer>10</integer>
+          <key>ExitTimeOut</key>
+          <integer>120</integer>
           <key>ProcessType</key>
           <string>Standard</string>
           <key>SoftResourceLimits</key>
@@ -1057,6 +1195,10 @@ public struct ConfigGenerator {
           <dict>
             <key>PATH</key>
             <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
+            <key>HOME</key>
+            <string>\(asOwner ? LaunchdScripts.homePlaceholder : "/var/root")</string>
+            <key>USER</key>
+            <string>\(asOwner ? LaunchdScripts.userPlaceholder : "root")</string>
           </dict>
           <key>StandardOutPath</key>
           <string>\(xml(directory))/logs/\(service).log</string>

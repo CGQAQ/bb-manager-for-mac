@@ -233,7 +233,7 @@ struct MachineDetailView: View {
             }
         } else if machine.facts?.isMacOS == true {
             if model.roles(on: machine.id).isEmpty {
-                Banner(symbol: "apple.logo", tint: .accentColor, text: "This Mac can run a native worker: BB Manager installs bb_worker and bb_runner in \(machine.installDirectory) and keeps them running with launchd. No Docker needed.", actionTitle: model.cluster.main == nil ? nil : "Add as Worker…") {
+                Banner(symbol: "apple.logo", tint: .accentColor, text: "This Mac can run a native worker: BB Manager installs bb_worker and bb_runner in \(machine.installDirectory) and runs them as launchd daemons; build actions run as your user. No Docker needed.", actionTitle: model.cluster.main == nil ? nil : "Add as Worker…") {
                     model.sheet = .addWorker(preselectedMachine: machine.id)
                 }
             }
@@ -539,13 +539,15 @@ struct MachineEditorSheet: View {
                 var note: String?
                 var warning: String?
                 if facts.isMacOS {
-                    // Macs run native workers as this user: no sudo, no Docker.
+                    // Macs run native workers as launchd daemons: no Docker, but sudo to install them.
                     draft.facts = facts
                     let previousDirectory = draft.installDirectory
                     let previousPrivilege = draft.privilege
                     draft.adoptNativeMode()
-                    note = "This is a Mac, so it runs native workers (bb_worker under launchd) without Docker or sudo"
-                        + (draft.installDirectory != previousDirectory ? ", installed in \(draft.installDirectory)." : ".")
+                    note = "This is a Mac, so it runs native workers without Docker"
+                        + (draft.installDirectory != previousDirectory ? ", installed in \(draft.installDirectory)" : "")
+                        + ". Builds run as this user, but bb_worker runs as a root launchd daemon, the only kind macOS lets reach the local network, so BB Manager uses sudo"
+                        + (draft.privilege == .sudoWithPassword ? " with the password below." : ".")
                     if draft.installDirectory != previousDirectory || draft.privilege != previousPrivilege {
                         facts = try await model.inspect(normalizedDraft())
                     }

@@ -151,11 +151,24 @@ public struct Machine: Codable, Identifiable, Hashable, Sendable {
         }
     }
 
-    /// macOS workers run as the SSH user from the home directory, without sudo or Docker.
+    /// macOS workers live in the home directory and run as the SSH user, but they are
+    /// installed as launchd daemons (the only kind macOS lets reach the local network),
+    /// which needs administrator rights.
     public mutating func adoptNativeMode() {
-        privilege = .none
+        adoptNativePrivileges()
         if let directory = facts?.dockerGroupInstallDirectory(current: installDirectory) {
             installDirectory = directory
+        }
+    }
+
+    /// Picks a privilege mode that can install launchd daemons, if the current one can't.
+    public mutating func adoptNativePrivileges() {
+        if facts?.isRoot == true {
+            privilege = .none
+        } else if facts?.passwordlessSudo == true {
+            if privilege == .none { privilege = .sudo }
+        } else if privilege != .sudoWithPassword {
+            privilege = .sudoWithPassword
         }
     }
 
@@ -276,8 +289,12 @@ public enum WorkerKind: String, Codable, CaseIterable, Sendable, Identifiable {
     case fuse
     /// Classic build directory populated with hardlinks from a local cache.
     case hardlinking
-    /// bb_worker and bb_runner run directly on macOS under launchd, without Docker.
+    /// bb_worker and bb_runner run directly on macOS under launchd, without Docker,
+    /// hardlinking inputs from a local cache into a real build directory.
     case native
+    /// Native macOS worker whose build directory is a virtual file system that
+    /// bb_worker serves over NFSv4, so inputs are fetched only when read.
+    case nativeNFSv4
 
     public var id: String { rawValue }
 
@@ -285,7 +302,8 @@ public enum WorkerKind: String, Codable, CaseIterable, Sendable, Identifiable {
         switch self {
         case .fuse: "FUSE (recommended)"
         case .hardlinking: "Hardlinking"
-        case .native: "Native (macOS, no Docker)"
+        case .native: "Hardlinking (native macOS)"
+        case .nativeNFSv4: "NFSv4 (native macOS, recommended)"
         }
     }
 
@@ -293,13 +311,20 @@ public enum WorkerKind: String, Codable, CaseIterable, Sendable, Identifiable {
         switch self {
         case .fuse: "FUSE"
         case .hardlinking: "Hardlinking"
-        case .native: "Native macOS"
+        case .native: "macOS · Hardlinking"
+        case .nativeNFSv4: "macOS · NFSv4"
         }
     }
 
-    /// Kinds a machine can run.
+    /// Runs directly on macOS under launchd rather than in Docker.
+    public var isNative: Bool { self == .native || self == .nativeNFSv4 }
+
+    /// Serves inputs lazily from a virtual file system (FUSE or NFSv4).
+    public var isVirtual: Bool { self == .fuse || self == .nativeNFSv4 }
+
+    /// Kinds a machine can run, recommended first.
     public static func available(onMacOS: Bool) -> [WorkerKind] {
-        onMacOS ? [.native] : [.fuse, .hardlinking]
+        onMacOS ? [.nativeNFSv4, .native] : [.fuse, .hardlinking]
     }
 }
 

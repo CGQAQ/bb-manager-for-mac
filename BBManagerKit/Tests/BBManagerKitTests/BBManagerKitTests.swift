@@ -9,24 +9,86 @@ import Testing
     }
 
     @Test func wrapsWithSudo() {
-        #expect(Shell.remoteCommand(script: "id", privilege: .sudo).hasPrefix("sudo -n sh -c '"))
-        #expect(Shell.remoteCommand(script: "id", privilege: .sudoWithPassword).hasPrefix("sudo -k -S -p '' sh -c '"))
-        #expect(Shell.remoteCommand(script: "id", privilege: nil).hasPrefix("sh -c '"))
+        #expect(Shell.remoteInvocation(script: "id", privilege: .sudo).command.contains("exec sudo -n sh -c"))
+        let withPassword = Shell.remoteInvocation(script: "id", privilege: .sudoWithPassword, password: "pw")
+        #expect(withPassword.command.contains("sudo -k -S -p"))
+        #expect(String(decoding: withPassword.input, as: UTF8.self) == "pw\nexec </dev/null\nid")
+        let plain = Shell.remoteInvocation(script: "id", privilege: nil)
+        #expect(plain.command.hasPrefix("sh -c '"))
+        #expect(!plain.command.contains("sudo"))
+        #expect(String(decoding: plain.input, as: UTF8.self) == "exec </dev/null\nid")
+    }
+
+    /// Large command lines break SSH connection sharing on macOS ("mm_send_fd: Message too long").
+    @Test func commandLineStaysShortForLargeScripts() {
+        let script = String(repeating: "echo 0123456789abcdef\n", count: 5_000)
+        for privilege in [nil, PrivilegeMode.none, .sudo, .sudoWithPassword] {
+            let invocation = Shell.remoteInvocation(script: script, privilege: privilege, password: "pw")
+            #expect(invocation.command.utf8.count < 200)
+            #expect(invocation.input.count > script.utf8.count)
+        }
     }
 
     @Test func remoteCommandRoundTripsThroughShell() throws {
-        let script = #"echo "a'b" && printf '%s\n' "$HOME" | wc -c"#
-        let command = Shell.remoteCommand(script: script, privilege: nil)
+        let script = #"echo "a'b" && printf '%s\n' "$HOME" | wc -c && cat"#
+        let output = try Self.runLocally(Shell.remoteInvocation(script: script, privilege: nil))
+        #expect(output.text.hasPrefix("a'b\n"))
+        #expect(output.status == 0)
+    }
+
+    /// The password reaches sudo and only sudo; the script runs with nothing on standard input.
+    @Test func passesPasswordToSudoAndScriptToShell() throws {
+        let bin = FileManager.default.temporaryDirectory.appendingPathComponent("bbm-fake-sudo-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: bin) }
+        let sudo = bin.appendingPathComponent("sudo")
+        try """
+        #!/bin/sh
+        while [ $# -gt 0 ]; do case "$1" in -k|-S|-n) shift ;; -p) shift 2 ;; *) break ;; esac; done
+        IFS= read -r pw
+        [ "$pw" = "$EXPECTED_PASSWORD" ] || { echo "sudo: incorrect password"; exit 1; }
+        exec "$@"
+        """.write(to: sudo, atomically: true, encoding: .utf8)
+        chmod(sudo.path, 0o755)
+
+        let script = #"echo "ran as $0"; if read -r leftover; then echo "stdin: $leftover"; fi; exit 3"#
+        let good = try Self.runLocally(
+            Shell.remoteInvocation(script: script, privilege: .sudoWithPassword, password: #"s3cret 'x\"#),
+            path: bin.path
+        )
+        #expect(good.text == "ran as sh\n")
+        #expect(good.status == 3)
+
+        let bad = try Self.runLocally(
+            Shell.remoteInvocation(script: script, privilege: .sudoWithPassword, password: "wrong"),
+            path: bin.path
+        )
+        #expect(bad.text.contains("incorrect password"))
+        #expect(bad.status == 1)
+    }
+
+    /// Runs an invocation with /bin/sh standing in for the remote login shell.
+    static func runLocally(_ invocation: Shell.RemoteInvocation, path: String? = nil) throws -> (text: String, status: Int32) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", command]
-        let pipe = Pipe()
-        process.standardOutput = pipe
+        process.arguments = ["-c", invocation.command]
+        if let path {
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = path + ":/usr/bin:/bin"
+            env["EXPECTED_PASSWORD"] = #"s3cret 'x\"#
+            process.environment = env
+        }
+        let output = Pipe()
+        let input = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        process.standardInput = input
         try process.run()
+        try input.fileHandleForWriting.write(contentsOf: invocation.input)
+        try input.fileHandleForWriting.close()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        #expect(output.hasPrefix("a'b\n"))
-        #expect(process.terminationStatus == 0)
+        return (String(decoding: data, as: UTF8.self), process.terminationStatus)
     }
 }
 
@@ -328,29 +390,97 @@ import Testing
         let runner = try #require(plan.files.first { $0.path == "config/runner.jsonnet" }).content
         #expect(runner.contains("listenPaths: ['runner.sock'],"))
 
-        // launchd agents are valid property lists that start in the worker directory.
-        let plistFile = try #require(plan.files.first { $0.path == "launchd/dev.bbmanager.bb-worker.plist" })
-        let plist = try #require(try PropertyListSerialization.propertyList(from: Data(plistFile.content.utf8), format: nil) as? [String: Any])
+        // launchd daemons are valid property lists that start in the worker directory.
+        func daemon(_ service: String) throws -> [String: Any] {
+            let file = try #require(plan.files.first { $0.path == "launchd/dev.bbmanager.bb-\(service).plist" })
+            return try #require(try PropertyListSerialization.propertyList(from: Data(file.content.utf8), format: nil) as? [String: Any])
+        }
+        let plist = try daemon("worker")
         #expect(plist["Label"] as? String == "dev.bbmanager.bb-worker")
         #expect(plist["ProgramArguments"] as? [String] == ["/Users/builder/buildbarn/worker/bin/bb_worker", "/Users/builder/buildbarn/worker/config/worker.jsonnet"])
         #expect(plist["WorkingDirectory"] as? String == "/Users/builder/buildbarn/worker")
         #expect(plist["KeepAlive"] as? Bool == true)
+        // bb_worker reaches the network, so it runs as root: macOS Local Network privacy
+        // blocks daemons with UserName. Its umask lets the runner write build directories.
+        #expect(plist["UserName"] == nil)
+        #expect(plist["GroupName"] == nil)
+        #expect(plist["Umask"] as? Int == 2)
+        #expect((plist["EnvironmentVariables"] as? [String: String])?["HOME"] == "/var/root")
+        // bb_runner runs the build actions as the SSH user.
+        let runnerPlist = try daemon("runner")
+        #expect(runnerPlist["UserName"] as? String == "__BBM_USER__")
+        #expect(runnerPlist["GroupName"] as? String == "__BBM_GROUP__")
+        #expect(runnerPlist["Umask"] == nil)
+        #expect((runnerPlist["EnvironmentVariables"] as? [String: String])?["HOME"] == "__BBM_HOME__")
 
         let deploy = RemoteScripts.install(plan, pullImages: true)
         #expect(deploy.contains("base64 -D"))
         #expect(deploy.contains("https://github.com/buildbarn/bb-remote-execution/releases/download/$TAG/$b.$ARCH"))
         #expect(deploy.contains("TAG='20261102T094740Z-c9ba98c'"))
-        #expect(deploy.contains("launchctl bootstrap \"$LD\" \"$AGENTS/dev.bbmanager.bb-runner.plist\""))
+        #expect(deploy.contains("launchctl bootstrap \"$LD\" \"$DAEMONS/dev.bbmanager.bb-runner.plist\""))
+        #expect(deploy.contains("LD=system"))
+        #expect(deploy.contains("chown root:wheel \"$DAEMONS/dev.bbmanager.bb-worker.plist\""))
+        #expect(deploy.contains("chown -R \"$OWNER:$OWNER_GROUP\" \"$DIR\""))
+        #expect(deploy.contains("bbm_remove_agent dev.bbmanager.bb-worker \"$OWNER\""))
+        #expect(deploy.contains("if [ \"$(id -u)\" != 0 ]; then"))
         #expect(!deploy.contains("$DC"))
         #expect(RemoteScripts.control(.restart, plan: plan, service: "worker").contains("launchctl kickstart -k \"$LD/dev.bbmanager.bb-worker\""))
         #expect(RemoteScripts.logs(plan: plan, service: nil, tail: 100, follow: true).contains("tail -n 100 -F logs/runner.log logs/worker.log"))
-        #expect(RemoteScripts.remove(plan, removeData: false).contains("rm -f \"$AGENTS/dev.bbmanager.bb-worker.plist\""))
+        #expect(RemoteScripts.remove(plan, removeData: false).contains("rm -f \"$DAEMONS/dev.bbmanager.bb-worker.plist\""))
 
         let poll = RemoteScripts.poll(installDirectory: mac.installDirectory, nodes: [
             RemoteScripts.PollNode(key: "worker", directory: plan.directory, diagnostics: plan.diagnostics, runtime: .launchd),
         ], includeMetrics: true)
         #expect(poll.contains("bbm_status worker '/Users/builder/buildbarn/worker'"))
         #expect(poll.contains("sysctl -n vm.loadavg"))
+    }
+
+    @Test func nativeMacNFSv4WorkerPlan() throws {
+        #expect(WorkerKind.available(onMacOS: true) == [.nativeNFSv4, .native])
+        #expect(WorkerKind.nativeNFSv4.isNative && WorkerKind.nativeNFSv4.isVirtual)
+
+        var mac = Machine(name: "build-mac", host: "10.0.0.20", user: "builder", privilege: PrivilegeMode.none, installDirectory: "/Users/builder/buildbarn")
+        var facts = MachineFacts()
+        facts.kernelName = "Darwin"
+        facts.architecture = "arm64"
+        mac.facts = facts
+        var cluster = ClusterConfiguration()
+        cluster.main = MainNodeSettings(machineID: UUID(), advertisedAddress: "10.0.0.5")
+        var settings = WorkerSettings()
+        settings.kind = .nativeNFSv4
+        settings.concurrency = 4
+        settings.filePoolPerActionGiB = 1
+        let worker = WorkerNode(machineID: mac.id, settings: settings)
+        cluster.workers = [worker]
+        let plan = try #require(ConfigGenerator(cluster: cluster, machines: [mac]).workerPlan(worker))
+        #expect(plan.runtime == .launchd)
+
+        let config = try #require(plan.files.first { $0.path == "config/worker.jsonnet" }).content
+        #expect(config.contains("mountPath: '/Users/builder/buildbarn/worker/build',"))
+        #expect(config.contains("darwin: { socketPath: '/Users/builder/buildbarn/worker/nfsv4.sock' },"))
+        #expect(config.contains("enforcedLeaseTime: '120s',"))
+        #expect(config.contains("announcedLeaseTime: '60s',"))
+        #expect(config.contains("path: '/Users/builder/buildbarn/worker/cs/blocks',"))
+        #expect(config.contains("path: '/Users/builder/buildbarn/worker/filepool',"))
+        #expect(config.contains("sizeBytes: 4 * 1024 * 1024 * 1024,"))
+        #expect(config.contains("address: 'unix:runner.sock'"))
+
+        // The worker gets time to deregister and unmount before launchd kills it.
+        let plistFile = try #require(plan.files.first { $0.path == "launchd/dev.bbmanager.bb-worker.plist" })
+        let plist = try #require(try PropertyListSerialization.propertyList(from: Data(plistFile.content.utf8), format: nil) as? [String: Any])
+        #expect(plist["ExitTimeOut"] as? Int == 120)
+
+        // Never delete the build directory through a live NFS mount.
+        #expect(plan.prepareScript.contains("pwd -P"))
+        #expect(plan.prepareScript.contains("umount -f"))
+        let unmount = try #require(plan.prepareScript.range(of: "umount -f"))
+        let delete = try #require(plan.prepareScript.range(of: "rm -rf build"))
+        #expect(unmount.lowerBound < delete.lowerBound)
+        let uninstall = RemoteScripts.remove(plan, removeData: true)
+        let uninstallUnmount = try #require(uninstall.range(of: "umount -f"))
+        let uninstallDelete = try #require(uninstall.range(of: "rm -rf '/Users/builder/buildbarn/worker'"))
+        #expect(uninstallUnmount.lowerBound < uninstallDelete.lowerBound)
+        #expect(RemoteScripts.install(plan, pullImages: true).contains("${#DIR} -gt 90"))
     }
 
     @Test func parsesMacOSHostStatsAndLaunchdStatus() throws {
@@ -389,8 +519,14 @@ import Testing
         #expect(facts.buildbarnPlatform == "darwin_arm64")
         var machine = Machine(host: "mac", privilege: .sudoWithPassword, facts: facts)
         machine.adoptNativeMode()
-        #expect(machine.privilege == PrivilegeMode.none)
+        // Installing launchd daemons needs sudo; this user has no passwordless sudo.
+        #expect(machine.privilege == .sudoWithPassword)
         #expect(machine.installDirectory == "/Users/builder/buildbarn")
+        var passwordless = facts
+        passwordless.passwordlessSudo = true
+        var other = Machine(host: "mac", privilege: PrivilegeMode.none, facts: passwordless)
+        other.adoptNativePrivileges()
+        #expect(other.privilege == .sudo)
     }
 
     @Test func parsesComposeJSONArray() {
@@ -492,7 +628,7 @@ import Testing
         let script = RemoteScripts.deploy(plan, pullImages: true)
         #expect(script.contains("base64 -d > 'config/storage.jsonnet.bbm-tmp'"))
         #expect(script.contains("$DC pull"))
-        #expect(Shell.remoteCommand(script: script, privilege: .sudo).utf8.count < 120_000)
+        #expect(script.utf8.count < 120_000)
     }
 
     @Test func bazelrcMentionsEndpoints() throws {

@@ -281,10 +281,15 @@ final class AppModel {
             var facts = try await inspect(machine)
             if let index = machines.firstIndex(where: { $0.id == id }) {
                 machines[index].facts = facts
-                // Macs run native workers as the SSH user: no sudo, no Docker, home directory.
-                if facts.isMacOS, !roles(on: id).contains(where: { deployedAt($0) != nil }) {
+                // Macs run native workers from the home directory as launchd daemons,
+                // which needs sudo. Keep the directory of anything already deployed.
+                if facts.isMacOS {
                     var native = machines[index]
-                    native.adoptNativeMode()
+                    if roles(on: id).contains(where: { deployedAt($0) != nil }) {
+                        native.adoptNativePrivileges()
+                    } else {
+                        native.adoptNativeMode()
+                    }
                     if native.privilege != machine.privilege || native.installDirectory != machine.installDirectory {
                         machines[index] = native
                         if let again = try? await inspect(native) {
@@ -294,8 +299,7 @@ final class AppModel {
                     }
                 }
             }
-            // Docker isn't used on Macs, so a failing privileged Docker check doesn't limit them.
-            connectivity[id] = facts.isMacOS ? .online : (facts.privilegeError.map { .limited($0) } ?? .online)
+            connectivity[id] = facts.privilegeError.map { .limited($0) } ?? .online
         } catch {
             connectivity[id] = Connectivity.from(error)
         }

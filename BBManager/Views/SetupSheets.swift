@@ -197,7 +197,7 @@ struct AddWorkerSheet: View {
                 settings.instanceNamePrefix = existing
             }
             if machine.facts?.isMacOS == true {
-                settings.kind = .native
+                settings.kind = .nativeNFSv4
                 settings.advertiseContainerImage = false
                 settings.platformProperties = [PlatformProperty(name: "OSFamily", value: "darwin")]
             } else {

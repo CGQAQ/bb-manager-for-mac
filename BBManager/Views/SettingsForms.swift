@@ -169,7 +169,7 @@ struct WorkerSettingsSections: View {
     @Binding var settings: WorkerSettings
     var machine: Machine?
 
-    private var isNative: Bool { settings.kind == .native }
+    private var isNative: Bool { settings.kind.isNative }
 
     var body: some View {
         Section {
@@ -191,8 +191,10 @@ struct WorkerSettingsSections: View {
                 Text("FUSE workers expose inputs lazily through a virtual file system. They are the most efficient but need privileged containers and /dev/fuse.")
             case .hardlinking:
                 Text("Hardlinking workers copy inputs from a local cache into a real directory. Use them where FUSE is not available.")
+            case .nativeNFSv4:
+                Text("bb_worker and bb_runner run directly on this Mac as launchd daemons; build actions run as the SSH user. The build directory is a virtual file system that bb_worker serves over NFSv4, so inputs are fetched only when an action reads them. No kernel extension is needed.")
             case .native:
-                Text("bb_worker and bb_runner run directly on this Mac as launchd agents of the SSH user, downloaded from Buildbarn's release that matches the cluster. Inputs are hardlinked from a local cache.")
+                Text("bb_worker and bb_runner run directly on this Mac as launchd daemons, downloaded from Buildbarn's release that matches the cluster. Build actions run as the SSH user. Inputs are hardlinked from a local cache.")
             }
         }
 
@@ -214,8 +216,8 @@ struct WorkerSettingsSections: View {
         }
 
         Section("Caching") {
-            NumberField(title: settings.kind == .fuse ? "Local Blob Cache" : "Local File Cache", value: $settings.localCacheSizeGiB, unit: "GiB", range: 1...4096, step: 4)
-            if settings.kind != .fuse {
+            NumberField(title: settings.kind.isVirtual ? "Local Blob Cache" : "Local File Cache", value: $settings.localCacheSizeGiB, unit: "GiB", range: 1...4096, step: 4)
+            if !settings.kind.isVirtual {
                 IntegerField(title: "Maximum Cached Files", value: $settings.maximumCacheFileCount, range: 100...100_000_000, step: 10_000)
             } else {
                 NumberField(title: "Scratch Space per Action", value: $settings.filePoolPerActionGiB, unit: "GiB", range: 0.125...256, step: 0.5,
@@ -229,7 +231,7 @@ struct WorkerSettingsSections: View {
 
     private var diskBytes: Int64 {
         var gib = settings.localCacheSizeGiB * 1.0125
-        if settings.kind == .fuse {
+        if settings.kind.isVirtual {
             gib += settings.filePoolPerActionGiB * Double(max(1, settings.concurrency))
         }
         return Int64(gib * 1024 * 1024 * 1024)

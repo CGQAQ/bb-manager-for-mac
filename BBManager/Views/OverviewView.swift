@@ -20,6 +20,7 @@ struct OverviewView: View {
                         NodesCard()
                         EndpointsCard()
                     }
+                    ChromiumCard()
                     BazelCard()
                 }
             }
@@ -243,6 +244,69 @@ struct EndpointsCard: View {
     }
 }
 
+struct ChromiumCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Card(title: "Use with Chromium", symbol: "globe") {
+            if let setup = model.generator.chromiumSetup() {
+                Text("Point Siso in a Chromium checkout at this cluster. Its remote actions run on the Linux worker on \(setup.workerMachineName).")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Snippet(path: ".gclient", note: "Add to the custom_vars of the \"src\" solution.", text: setup.gclientCustomVars)
+                Snippet(path: "src/build/config/siso/backend_config/backend.star", note: "Create this file. Buildbarn runs an action only on workers whose platform properties match it exactly.", text: setup.backendStar)
+                Snippet(path: "src/build/config/siso/.sisorc", note: "Create this file: the cluster has no TLS or authentication.", text: setup.sisorc)
+                Snippet(path: "out/Default/args.gn", note: "Turn on remote execution.", text: setup.argsGN)
+                Snippet(path: "In src", note: "Apply the configuration, then build.", text: setup.commands)
+            } else {
+                Text("Chromium sends its remote actions to Linux workers. Add a worker on a Linux machine to build Chromium with this cluster.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+/// A file or command to copy, with where it goes.
+private struct Snippet: View {
+    var path: String
+    var note: String
+    var text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(path)
+                    .font(.system(.callout, design: .monospaced).weight(.semibold))
+                    .textSelection(.enabled)
+                Text(note)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer(minLength: 8)
+                CopyButton(text: text)
+                    .controlSize(.small)
+            }
+            CodeBlock(text: text.trimmingCharacters(in: .newlines))
+        }
+        .padding(.top, 4)
+    }
+}
+
+private struct CodeBlock: View {
+    var text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(.callout, design: .monospaced))
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
+    }
+}
+
 struct BazelCard: View {
     @Environment(AppModel.self) private var model
 
@@ -252,13 +316,7 @@ struct BazelCard: View {
                 Text("Add these lines to your project's `.bazelrc`, then build with `bazel build --config=bb //...`.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                Text(rc)
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
-                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
+                CodeBlock(text: rc)
                 HStack {
                     Spacer()
                     CopyButton(text: rc)

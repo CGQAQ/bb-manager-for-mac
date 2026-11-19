@@ -639,6 +639,37 @@ import Testing
         #expect(rc.contains("--remote_default_exec_properties=OSFamily=linux"))
     }
 
+    @Test func chromiumSetupTargetsLinuxWorker() throws {
+        var (cluster, machines) = Self.cluster()
+        cluster.workers[0].settings.instanceNamePrefix = "team"
+        cluster.workers[0].settings.platformProperties.append(PlatformProperty(name: "pool", value: "a\"b"))
+        // A Mac worker listed first is skipped: Chromium's remote actions need Linux.
+        let mac = Machine(name: "mac", host: "10.0.0.3", user: "builder")
+        var macSettings = WorkerSettings()
+        macSettings.kind = .nativeNFSv4
+        cluster.workers.insert(WorkerNode(machineID: mac.id, settings: macSettings), at: 0)
+        machines.append(mac)
+
+        let setup = try #require(ConfigGenerator(cluster: cluster, machines: machines).chromiumSetup())
+        #expect(setup.workerMachineName == "worker 1")
+        #expect(setup.gclientCustomVars.contains(#""reapi_address": "10.0.0.1:8980","#))
+        #expect(setup.gclientCustomVars.contains(#""reapi_instance": "team","#))
+        // Buildbarn matches platform properties exactly, so every advertised one is sent.
+        let advertised = cluster.workers[1].settings.effectivePlatformProperties
+        #expect(advertised.contains { $0.name == "OSFamily" })
+        for property in advertised where property.name != "pool" {
+            #expect(setup.backendStar.contains("\"\(property.name)\": \"\(property.value)\","))
+        }
+        #expect(setup.backendStar.contains(#""pool": "a\"b","#))
+        #expect(setup.backendStar.contains(#""default": linux,"#))
+        #expect(setup.backendStar.contains(#""large": linux,"#))
+        #expect(setup.sisorc == "ninja -reapi_insecure\n")
+        #expect(setup.argsGN == "use_remoteexec = true")
+
+        cluster.workers.removeLast()
+        #expect(ConfigGenerator(cluster: cluster, machines: machines).chromiumSetup() == nil)
+    }
+
     /// Writes a demo state file to $BBM_SAMPLE_STATE (launch the app with `-BBMStateFile <path>`).
     @Test func writeSampleStateIfRequested() throws {
         guard let path = ProcessInfo.processInfo.environment["BBM_SAMPLE_STATE"] else { return }

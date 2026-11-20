@@ -133,6 +133,9 @@ public enum LaunchdScripts {
         echo "==> Preparing directories"
         \(plan.prepareScript)
         chown -R "$OWNER:$OWNER_GROUP" "$DIR"
+        # The log keeps the stopped worker's shutdown messages; show only what the new one writes.
+        LOG_START=0
+        if [ -f logs/worker.log ]; then LOG_START=$(wc -c < logs/worker.log | tr -d ' '); fi
         echo "==> Starting launchd daemons"
         \(services.map { installDaemon(label($0)) }.joined(separator: "\n"))
         sleep 4
@@ -143,8 +146,9 @@ public enum LaunchdScripts {
           echo "    $line"
           case "$line" in *'"State":"running"'*) ;; *) failed=1 ;; esac
         done
-        echo "==> Recent worker log"
-        tail -n 20 logs/worker.log 2>/dev/null || true
+        echo "==> Worker log since start"
+        new_log=$(tail -c +$((${LOG_START:-0} + 1)) logs/worker.log 2>/dev/null | tail -n 20)
+        if [ -n "$new_log" ]; then printf '%s\\n' "$new_log"; else echo "    Nothing logged; bb_worker logs only problems."; fi
         if [ $failed = 1 ]; then
           echo "error: a service is not running. Its log is in $DIR/logs."
           exit 1

@@ -12,6 +12,8 @@ struct ConfigurationView: View {
                 TextField("Cluster Name", text: $model.cluster.name)
             } header: {
                 Text("General")
+            } footer: {
+                Text("Saved as you type. The name is also this profile's name. Only BB Manager uses it, so there is nothing to deploy.")
             }
 
             if !model.allRoles.isEmpty {
@@ -28,9 +30,7 @@ struct ConfigurationView: View {
                                     Label("Up to date", systemImage: "checkmark.circle")
                                         .foregroundStyle(.secondary)
                                 }
-                                Button("Settings…") {
-                                    model.selection = role.isMain ? .mainNode : .worker(role.workerID!)
-                                }
+                                Button("Settings…") { model.openSettings(of: role) }
                             }
                         } label: {
                             Label(model.title(for: role), systemImage: role.isMain ? "server.rack" : "cpu")
@@ -62,19 +62,33 @@ struct ConfigurationView: View {
                     Button("Reset to Recommended…") { confirmImageReset = true }
                         .disabled(model.cluster.images == .recommended)
                 }
+                if model.allRoles.contains(where: model.hasPendingChanges) {
+                    HStack {
+                        Label("Saved, but not deployed yet.", systemImage: "arrow.triangle.2.circlepath")
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button("Apply All Changes") { model.applyAllChanges() }
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
             } header: {
                 Text("Container Images")
             } footer: {
-                Text("Buildbarn publishes timestamped tags only. Keep bb-scheduler, bb-worker and bb-runner-installer on the same build. Applying changes pulls new images.")
+                Text("Saved as you change them. Nodes keep running their current images until you click Apply All Changes, which deploys every node with changes and pulls the new images. Buildbarn publishes timestamped tags only; keep bb-scheduler, bb-worker and bb-runner-installer on the same build.")
             }
 
             Section {
-                Text("New workers start with these settings. Existing workers keep their own.")
+                Text("Saved as you change them, and used only to fill in the form when you add a worker. Nothing is deployed, and workers that already exist keep their own settings: change those on each worker's Settings tab.")
                     .foregroundStyle(.secondary)
+                ForEach(model.cluster.workers) { worker in
+                    LabeledContent(model.machine(worker.machineID)?.displayName ?? "Worker") {
+                        Button("Open Worker Settings") { model.openSettings(of: .worker(worker.id)) }
+                    }
+                }
             } header: {
-                Text("Worker Defaults")
+                Text("Defaults for New Workers")
             }
-            WorkerSettingsSections(settings: $model.cluster.workerDefaults, machine: nil)
+            WorkerSettingsSections(settings: $model.cluster.workerDefaults, machine: nil, isDefaults: true)
         }
         .formStyle(.grouped)
         .navigationTitle("Configuration")

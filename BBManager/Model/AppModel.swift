@@ -27,6 +27,8 @@ final class AppModel {
     // MARK: UI state
 
     var selection: SidebarItem? = .overview
+    /// The tab a node's page should switch to when it next shows.
+    var requestedNodeTab: NodeTab?
     var sheet: ActiveSheet?
     var operation: OperationSession?
     var alert: AlertItem?
@@ -484,6 +486,15 @@ final class AppModel {
     }
 
     // MARK: - Nodes
+
+    /// Shows a node's page on its Settings tab.
+    func openSettings(of role: NodeRole) {
+        requestedNodeTab = .settings
+        switch role {
+        case .main: selection = .mainNode
+        case .worker(let id): selection = .worker(id)
+        }
+    }
 
     func setUpMainNode(_ settings: MainNodeSettings) {
         cluster.main = settings

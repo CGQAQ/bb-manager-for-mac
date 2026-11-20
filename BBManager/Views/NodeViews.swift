@@ -38,6 +38,11 @@ struct NodeDetailView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .onChange(of: model.requestedNodeTab, initial: true) { _, requested in
+            guard let requested else { return }
+            tab = requested
+            model.requestedNodeTab = nil
+        }
         .navigationTitle(model.title(for: role))
         .navigationSubtitle(model.machine(for: role)?.host ?? "")
         .toolbar {

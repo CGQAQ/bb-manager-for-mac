@@ -24,11 +24,28 @@ public enum LaunchdScripts {
     DAEMONS=/Library/LaunchDaemons
     bbm_loaded() { launchctl print "$LD/$1" >/dev/null 2>&1; }
     bbm_unload() {
-      launchctl bootout "$LD/$1" 2>/dev/null || true
-      i=0
+      bbm_loaded "$1" || return 0
       # On SIGTERM, bb_worker deregisters from the scheduler and unmounts its NFSv4
-      # build directory. That is quick, but slow when the scheduler is unreachable.
-      while bbm_loaded "$1" && [ $i -lt 520 ]; do sleep 0.25; i=$((i+1)); done
+      # build directory. That can take a while, and launchd kills it only after its
+      # ExitTimeOut, so report progress instead of looking stuck. bootout may wait
+      # for the exit itself, so it runs in the background.
+      launchctl bootout "$LD/$1" >/dev/null 2>&1 &
+      bbm_bootout=$!
+      bbm_start=$(date +%s)
+      bbm_next=10
+      while bbm_loaded "$1"; do
+        bbm_waited=$(( $(date +%s) - bbm_start ))
+        if [ $bbm_waited -ge 130 ]; then echo "    ${1#dev.bbmanager.} is still stopping after ${bbm_waited}s"; break; fi
+        if [ $bbm_waited -ge $bbm_next ]; then
+          echo "    Waiting for ${1#dev.bbmanager.} to stop (${bbm_waited}s)"
+          bbm_next=$((bbm_next + 10))
+        fi
+        sleep 0.25
+      done
+      bbm_waited=$(( $(date +%s) - bbm_start ))
+      if [ $bbm_waited -ge 10 ] && ! bbm_loaded "$1"; then echo "    ${1#dev.bbmanager.} stopped after ${bbm_waited}s"; fi
+      kill $bbm_bootout 2>/dev/null || true
+      wait $bbm_bootout 2>/dev/null || true
     }
     bbm_load() {
       if bbm_loaded "$1"; then launchctl kickstart "$LD/$1"; else launchctl bootstrap "$LD" "$DAEMONS/$1.plist"; fi

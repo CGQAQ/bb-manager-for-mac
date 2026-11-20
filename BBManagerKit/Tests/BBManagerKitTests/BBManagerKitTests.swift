@@ -67,6 +67,33 @@ import Testing
         #expect(bad.status == 1)
     }
 
+    /// `launchctl bootout` can block until the daemon exits; stopping a daemon watches
+    /// the daemon itself and never waits on a bootout that hangs.
+    @Test func unloadDoesNotWaitForABlockedBootout() throws {
+        let bin = FileManager.default.temporaryDirectory.appendingPathComponent("bbm-fake-launchctl-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: bin) }
+        let launchctl = bin.appendingPathComponent("launchctl")
+        // The daemon stays loaded until bootout starts; bootout itself then hangs.
+        try """
+        #!/bin/sh
+        case "$1" in
+          print) [ -f '\(bin.path)/booted' ] && exit 113; exit 0 ;;
+          bootout) touch '\(bin.path)/booted'; exec sleep 30 ;;
+        esac
+        """.write(to: launchctl, atomically: true, encoding: .utf8)
+        chmod(launchctl.path, 0o755)
+
+        let started = Date()
+        let result = try Self.runLocally(
+            Shell.remoteInvocation(script: "set -e\n\(LaunchdScripts.functions)\nbbm_unload dev.bbmanager.bb-worker\necho stopped", privilege: nil),
+            path: bin.path
+        )
+        #expect(result.text == "stopped\n")
+        #expect(result.status == 0)
+        #expect(Date().timeIntervalSince(started) < 10)
+    }
+
     /// Runs an invocation with /bin/sh standing in for the remote login shell.
     static func runLocally(_ invocation: Shell.RemoteInvocation, path: String? = nil) throws -> (text: String, status: Int32) {
         let process = Process()

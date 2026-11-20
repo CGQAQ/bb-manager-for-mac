@@ -1,14 +1,107 @@
 import Foundation
 
-/// Everything BB Manager remembers between launches (passwords live in the Keychain).
-public struct PersistedState: Codable, Sendable {
-    public var version: Int = 1
-    public var machines: [Machine] = []
-    public var cluster = ClusterConfiguration()
+/// A cluster and the machines it runs on. Each profile has its own machines, so
+/// switching profiles switches what BB Manager shows, polls and deploys; it never
+/// changes what runs on the machines. The profile's name is its cluster's name.
+public struct Profile: Codable, Hashable, Sendable, Identifiable {
+    public var id: UUID
+    public var machines: [Machine]
+    public var cluster: ClusterConfiguration
 
-    public init(machines: [Machine] = [], cluster: ClusterConfiguration = ClusterConfiguration()) {
+    public init(id: UUID = UUID(), machines: [Machine] = [], cluster: ClusterConfiguration = ClusterConfiguration()) {
+        self.id = id
         self.machines = machines
         self.cluster = cluster
+    }
+
+    public var name: String { cluster.name }
+
+    /// A copy under a new name. Its machines get new IDs, so their Keychain passwords
+    /// and settings are its own; `machineIDs` maps each old ID to its new one.
+    public func duplicated(name: String) -> (profile: Profile, machineIDs: [UUID: UUID]) {
+        var map: [UUID: UUID] = [:]
+        var copy = Profile(machines: machines, cluster: cluster)
+        for index in copy.machines.indices {
+            let newID = UUID()
+            map[copy.machines[index].id] = newID
+            copy.machines[index].id = newID
+        }
+        if let id = copy.cluster.main?.machineID, let newID = map[id] {
+            copy.cluster.main?.machineID = newID
+        }
+        for index in copy.cluster.workers.indices {
+            if let newID = map[copy.cluster.workers[index].machineID] {
+                copy.cluster.workers[index].machineID = newID
+            }
+        }
+        copy.cluster.name = name
+        return (copy, map)
+    }
+
+    /// `base`, or `base 2`, `base 3`… whichever no profile in `profiles` uses yet.
+    public static func uniqueName(_ base: String, among profiles: [Profile]) -> String {
+        let taken = Set(profiles.map { $0.name.lowercased() })
+        if !taken.contains(base.lowercased()) { return base }
+        var n = 2
+        while taken.contains("\(base) \(n)".lowercased()) { n += 1 }
+        return "\(base) \(n)"
+    }
+}
+
+/// Everything BB Manager remembers between launches (passwords live in the Keychain).
+public struct PersistedState: Codable, Sendable {
+    public var version = 2
+    public var profiles: [Profile]
+    public var activeProfileID: UUID
+
+    public init(profiles: [Profile], activeProfileID: UUID? = nil) {
+        let profiles = profiles.isEmpty ? [Profile()] : profiles
+        self.profiles = profiles
+        self.activeProfileID = activeProfileID.flatMap { id in profiles.contains { $0.id == id } ? id : nil } ?? profiles[0].id
+    }
+
+    /// A state with a single profile.
+    public init(machines: [Machine] = [], cluster: ClusterConfiguration = ClusterConfiguration()) {
+        self.init(profiles: [Profile(machines: machines, cluster: cluster)])
+    }
+
+    public var activeProfile: Profile {
+        get { profiles.first { $0.id == activeProfileID } ?? profiles[0] }
+        set {
+            if let index = profiles.firstIndex(where: { $0.id == newValue.id }) {
+                profiles[index] = newValue
+            } else {
+                profiles.append(newValue)
+            }
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version, profiles, activeProfileID, machines, cluster
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let profiles = try container.decodeIfPresent([Profile].self, forKey: .profiles), !profiles.isEmpty {
+            self.init(profiles: profiles, activeProfileID: try container.decodeIfPresent(UUID.self, forKey: .activeProfileID))
+        } else {
+            // Version 1 kept one cluster and its machines at the top level.
+            self.init(
+                machines: try container.decodeIfPresent([Machine].self, forKey: .machines) ?? [],
+                cluster: try container.decodeIfPresent(ClusterConfiguration.self, forKey: .cluster) ?? ClusterConfiguration()
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encode(profiles, forKey: .profiles)
+        try container.encode(activeProfileID, forKey: .activeProfileID)
+        // Also written the version 1 way, so an earlier BB Manager still opens the
+        // active profile instead of starting empty.
+        try container.encode(activeProfile.machines, forKey: .machines)
+        try container.encode(activeProfile.cluster, forKey: .cluster)
     }
 }
 

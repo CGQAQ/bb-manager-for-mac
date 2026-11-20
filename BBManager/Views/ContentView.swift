@@ -24,11 +24,18 @@ struct ContentView: View {
                 AddWorkerSheet(preselectedMachine: machineID)
             case .removeNode(let role):
                 RemoveNodeSheet(role: role)
+            case .newProfile:
+                ProfileNameSheet(purpose: .create)
+            case .duplicateProfile(let id):
+                ProfileNameSheet(purpose: .duplicate(id))
+            case .renameProfile(let id):
+                ProfileNameSheet(purpose: .rename(id))
             }
         }
         .sheet(item: $model.operation) { session in
             OperationConsoleView(session: session)
         }
+        .profileDeletionConfirmation(model)
         .alert(item: $model.alert) { item in
             Alert(title: Text(item.title), message: Text(item.message))
         }
@@ -153,6 +160,13 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            ProfileSwitcher()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.top, 4)
+                .padding(.bottom, 6)
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack {
                 Button {

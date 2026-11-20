@@ -75,6 +75,10 @@ struct AppCommands: Commands {
                 .keyboardShortcut("5")
             Divider()
         }
+        CommandMenu("Profile") {
+            ProfileMenuItems()
+                .environment(model)
+        }
         CommandMenu("Cluster") {
             Button("Refresh Status") { Task { await model.pollAll() } }
                 .keyboardShortcut("r")

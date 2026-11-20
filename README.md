@@ -7,6 +7,7 @@ A native macOS app (SwiftUI) for deploying and running a [Buildbarn](https://git
 - **Workers**: bb-worker and bb-runner in FUSE or hardlinking mode, with per-worker concurrency, cache sizes, runner image and platform properties.
 - **Statistics**: throughput, executing and queued actions, queue and execution latency, action cache hit rate, CAS traffic, per-stage worker timings, CPU and memory for each component and host, plus a metrics explorer for every Prometheus series.
 - **Configuration**: storage sizes, shards, timeouts, ports, portal settings and image versions. Any generated file can be edited by hand in the Files tab. Pending changes are tracked and applied with **Apply Changes**.
+- **Profiles**: keep several clusters, each with its own machines, and switch between them from the top of the sidebar or the Profile menu. Switching changes only what the app shows and manages; nodes keep running on their machines. A profile can be duplicated with its machines and saved passwords.
 - **Mac look and feel**: sidebar split view, toolbar actions, grouped forms, Swift Charts, a Settings window, keyboard shortcuts and a menu bar extra.
 
 ## Requirements

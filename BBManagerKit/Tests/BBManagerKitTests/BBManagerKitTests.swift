@@ -813,3 +813,89 @@ import Testing
         }
     }
 }
+
+@Suite struct ProfileTests {
+    static func sampleProfile(name: String) -> Profile {
+        let main = Machine(name: "main", host: "192.0.2.10", user: "builder")
+        let mac = Machine(name: "mac", host: "192.0.2.11", user: "builder")
+        var cluster = ClusterConfiguration()
+        cluster.name = name
+        cluster.main = MainNodeSettings(machineID: main.id, advertisedAddress: main.host)
+        cluster.workers = [
+            WorkerNode(machineID: main.id, settings: WorkerSettings()),
+            WorkerNode(machineID: mac.id, settings: WorkerSettings()),
+        ]
+        return Profile(machines: [main, mac], cluster: cluster)
+    }
+
+    static func roundTrip(_ state: PersistedState) throws -> (PersistedState, [String: Any]) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("bbm-profiles-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = StateStore(url: dir.appendingPathComponent("state.json"))
+        try store.save(state)
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: store.url)) as? [String: Any])
+        return (try store.load(), json)
+    }
+
+    /// State saved before profiles existed becomes a single profile.
+    @Test func migratesASingleClusterIntoAProfile() throws {
+        let old = Self.sampleProfile(name: "Home")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var json = try #require(try JSONSerialization.jsonObject(with: encoder.encode(old)) as? [String: Any])
+        json["id"] = nil
+        json["version"] = 1
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("bbm-v1-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("state.json")
+        try JSONSerialization.data(withJSONObject: json).write(to: url)
+
+        let state = try StateStore(url: url).load()
+        #expect(state.profiles.count == 1)
+        #expect(state.activeProfileID == state.profiles[0].id)
+        #expect(state.activeProfile.name == "Home")
+        #expect(state.activeProfile.machines == old.machines)
+        #expect(state.activeProfile.cluster == old.cluster)
+    }
+
+    @Test func savesEveryProfileAndTheActiveOne() throws {
+        let home = Self.sampleProfile(name: "Home")
+        let office = Self.sampleProfile(name: "Office")
+        let (loaded, json) = try Self.roundTrip(PersistedState(profiles: [home, office], activeProfileID: office.id))
+        #expect(loaded.profiles == [home, office])
+        #expect(loaded.activeProfileID == office.id)
+        // Earlier versions read the top-level cluster: it is the active profile's.
+        let cluster = try #require(json["cluster"] as? [String: Any])
+        #expect(cluster["name"] as? String == "Office")
+        #expect((json["machines"] as? [Any])?.count == 2)
+    }
+
+    @Test func fallsBackToTheFirstProfileWhenTheActiveOneIsMissing() {
+        let home = Self.sampleProfile(name: "Home")
+        #expect(PersistedState(profiles: [home], activeProfileID: UUID()).activeProfileID == home.id)
+        #expect(PersistedState(profiles: []).profiles.count == 1)
+    }
+
+    /// A copy's machines get new IDs (and so their own Keychain entries), and its
+    /// nodes follow them.
+    @Test func duplicatesWithNewMachineIDs() {
+        let source = Self.sampleProfile(name: "Home")
+        let (copy, map) = source.duplicated(name: "Home Copy")
+        #expect(copy.id != source.id)
+        #expect(copy.name == "Home Copy")
+        #expect(source.name == "Home")
+        #expect(copy.machines.count == 2)
+        #expect(Set(copy.machines.map(\.id)).isDisjoint(with: source.machines.map(\.id)))
+        #expect(copy.machines.map(\.host) == source.machines.map(\.host))
+        #expect(copy.cluster.main?.machineID == map[source.machines[0].id])
+        #expect(copy.cluster.workers.map(\.machineID) == source.cluster.workers.map { map[$0.machineID]! })
+        #expect(Set(copy.cluster.workers.map(\.machineID)).isSubset(of: copy.machines.map(\.id)))
+    }
+
+    @Test func picksUnusedNames() {
+        let profiles = [Self.sampleProfile(name: "Home"), Self.sampleProfile(name: "home 2")]
+        #expect(Profile.uniqueName("Office", among: profiles) == "Office")
+        #expect(Profile.uniqueName("Home", among: profiles) == "Home 3")
+    }
+}

@@ -19,6 +19,9 @@ enum ActiveSheet: Identifiable {
     case setUpMainNode
     case addWorker(preselectedMachine: UUID?)
     case removeNode(NodeRole)
+    case newProfile
+    case duplicateProfile(UUID)
+    case renameProfile(UUID)
 
     var id: String {
         switch self {
@@ -27,6 +30,9 @@ enum ActiveSheet: Identifiable {
         case .setUpMainNode: "setUpMain"
         case .addWorker: "addWorker"
         case .removeNode(let role): "remove-\(role)"
+        case .newProfile: "newProfile"
+        case .duplicateProfile(let id): "duplicateProfile-\(id)"
+        case .renameProfile(let id): "renameProfile-\(id)"
         }
     }
 }

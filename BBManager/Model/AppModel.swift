@@ -16,6 +16,14 @@ final class AppModel {
         didSet { scheduleSave() }
     }
 
+    /// Every saved profile. The active one's machines and cluster live in `machines`
+    /// and `cluster` and are copied back here when saving or switching; use
+    /// `allProfiles` for an up-to-date list.
+    private(set) var profiles: [Profile] = []
+    private(set) var activeProfileID = UUID()
+    /// The profile waiting for the user to confirm its deletion.
+    var profilePendingDeletion: Profile?
+
     // MARK: UI state
 
     var selection: SidebarItem? = .overview
@@ -49,6 +57,8 @@ final class AppModel {
     @ObservationIgnored private var inFlightPolls: Set<UUID> = []
     @ObservationIgnored private var inspectedThisSession: Set<UUID> = []
     @ObservationIgnored private var isLoading = false
+    /// Changes on every profile switch, so results of polls started before it are dropped.
+    @ObservationIgnored private var profileGeneration = 0
 
     init() {
         AppDefaults.register()
@@ -56,10 +66,15 @@ final class AppModel {
         isLoading = true
         do {
             let state = try store.load()
-            machines = state.machines
-            cluster = state.cluster
+            profiles = state.profiles
+            activeProfileID = state.activeProfileID
+            machines = state.activeProfile.machines
+            cluster = state.activeProfile.cluster
         } catch {
             loadError = "Could not read saved state: \(error.localizedDescription)"
+            let profile = Profile()
+            profiles = [profile]
+            activeProfileID = profile.id
         }
         isLoading = false
         #if DEBUG
@@ -102,11 +117,127 @@ final class AppModel {
     }
 
     func saveNow() {
+        storeActiveProfile()
         do {
-            try store.save(PersistedState(machines: machines, cluster: cluster))
+            try store.save(PersistedState(profiles: profiles, activeProfileID: activeProfileID))
         } catch {
             alert = AlertItem(title: "Could Not Save", message: error.localizedDescription)
         }
+    }
+
+    // MARK: - Profiles
+
+    var activeProfile: Profile { Profile(id: activeProfileID, machines: machines, cluster: cluster) }
+
+    /// Every profile, with the active one's current machines and cluster.
+    var allProfiles: [Profile] {
+        profiles.map { $0.id == activeProfileID ? activeProfile : $0 }
+    }
+
+    private func storeActiveProfile() {
+        if let index = profiles.firstIndex(where: { $0.id == activeProfileID }) {
+            profiles[index] = activeProfile
+        } else {
+            profiles.append(activeProfile)
+        }
+    }
+
+    /// Why switching profiles isn't possible right now, or nil if it is.
+    var profileSwitchBlocker: String? {
+        guard let operation, operation.isRunning else { return nil }
+        return "“\(operation.title)” is still running. Wait for it to finish or cancel it first."
+    }
+
+    /// Shows another profile. Nothing on any machine changes: the previous profile's
+    /// nodes keep running, they just aren't shown or polled while it is inactive.
+    func switchProfile(to id: UUID) {
+        guard id != activeProfileID, let target = profiles.first(where: { $0.id == id }) else { return }
+        if let blocker = profileSwitchBlocker {
+            alert = AlertItem(title: "Cannot Switch Profiles", message: blocker)
+            return
+        }
+        storeActiveProfile()
+        profileGeneration += 1
+        sheet = nil
+        operation = nil
+        busyNodes = []
+        connectivity = [:]
+        hostSamples = [:]
+        hostHistory = [:]
+        containerUsage = [:]
+        discoveredProjects = [:]
+        nodeRuntime = [:]
+        metrics = [:]
+        previousMetrics = [:]
+        clusterHistory = []
+        lastPoll = nil
+        isLoading = true
+        activeProfileID = id
+        machines = target.machines
+        cluster = target.cluster
+        isLoading = false
+        selection = .overview
+        saveNow()
+        Task { await pollAll() }
+    }
+
+    /// Creates an empty profile and switches to it.
+    func createProfile(named name: String) {
+        if let blocker = profileSwitchBlocker {
+            alert = AlertItem(title: "Cannot Create a Profile", message: blocker)
+            return
+        }
+        var profile = Profile()
+        profile.cluster.name = name
+        profiles.append(profile)
+        switchProfile(to: profile.id)
+    }
+
+    /// Copies a profile, with its machines' saved passwords, and switches to the copy.
+    func duplicateProfile(_ id: UUID, named name: String) {
+        if let blocker = profileSwitchBlocker {
+            alert = AlertItem(title: "Cannot Duplicate the Profile", message: blocker)
+            return
+        }
+        guard let source = allProfiles.first(where: { $0.id == id }) else { return }
+        let (copy, _) = source.duplicated(name: name)
+        for (old, new) in zip(source.machines, copy.machines) {
+            guard let password = Keychain.password(account: old.keychainAccount) else { continue }
+            do {
+                try Keychain.setPassword(password, account: new.keychainAccount)
+            } catch {
+                alert = AlertItem(title: "Could Not Copy a Password", message: "\(new.displayName): \(error.localizedDescription)")
+            }
+        }
+        profiles.append(copy)
+        switchProfile(to: copy.id)
+    }
+
+    func renameProfile(_ id: UUID, to name: String) {
+        if id == activeProfileID {
+            cluster.name = name
+        } else if let index = profiles.firstIndex(where: { $0.id == id }) {
+            profiles[index].cluster.name = name
+            saveNow()
+        }
+    }
+
+    /// Forgets a profile, its machines and their saved passwords. Nodes it deployed
+    /// keep running; remove them first to stop them.
+    func deleteProfile(_ id: UUID) {
+        guard profiles.count > 1, let profile = allProfiles.first(where: { $0.id == id }) else { return }
+        if id == activeProfileID {
+            guard let other = profiles.first(where: { $0.id != id }) else { return }
+            switchProfile(to: other.id)
+            guard activeProfileID != id else { return }
+        }
+        // SSH connections are shared per host, possibly with another profile's
+        // machines, so they are left to expire on their own.
+        for machine in profile.machines {
+            Keychain.deletePassword(account: machine.keychainAccount)
+        }
+        profiles.removeAll { $0.id == id }
+        saveNow()
     }
 
     func applySSHSettings() {
@@ -654,6 +785,7 @@ final class AppModel {
     }
 
     func pollAll() async {
+        let generation = profileGeneration
         isPolling = true
         await withTaskGroup(of: Void.self) { group in
             for machine in machines {
@@ -661,8 +793,10 @@ final class AppModel {
                 group.addTask { await self.poll(id) }
             }
         }
-        recordClusterPoint()
-        lastPoll = Date()
+        if generation == profileGeneration {
+            recordClusterPoint()
+            lastPoll = Date()
+        }
         isPolling = false
     }
 
@@ -677,6 +811,7 @@ final class AppModel {
         guard let machine = machine(machineID), !inFlightPolls.contains(machineID) else { return }
         inFlightPolls.insert(machineID)
         defer { inFlightPolls.remove(machineID) }
+        let generation = profileGeneration
 
         let nodes = pollNodes(on: machine)
         let script = RemoteScripts.poll(installDirectory: machine.installDirectory, nodes: nodes.map(\.1), includeMetrics: true)
@@ -685,6 +820,8 @@ final class AppModel {
         }
         do {
             let result = try await ssh.run(machine, script: script, privileged: true, timeout: 30)
+            // Node roles repeat across profiles; drop results from a profile switched away from.
+            guard generation == profileGeneration else { return }
             let now = Date()
             let output = PollOutput(result.stdout)
             // The script's last command may legitimately fail (grep with no matches),
@@ -719,6 +856,7 @@ final class AppModel {
                 }
             }
         } catch {
+            guard generation == profileGeneration else { return }
             connectivity[machineID] = Connectivity.from(error)
             for (role, _) in nodes {
                 nodeRuntime[role, default: NodeRuntime()].error = error.localizedDescription

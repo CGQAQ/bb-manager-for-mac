@@ -669,7 +669,7 @@ public struct ConfigGenerator {
     func workerPrepareScript(_ s: WorkerSettings) -> String {
         let layout = Self.shortHash("\(s.kind.rawValue)|\(s.localCacheSizeGiB)|\(s.maximumCacheFileCount)")
         return """
-        umount volumes/worker/build 2>/dev/null || umount -l volumes/worker/build 2>/dev/null || true
+        \(Self.unmountWorkerBuildDirectory(helperImage: s.runnerImage))
         LAYOUT='\(layout)'
         if [ -d volumes ] && [ "$(cat volumes/.cache-layout 2>/dev/null)" != "$LAYOUT" ]; then
           echo "Worker cache settings changed: clearing local cache."
@@ -681,6 +681,31 @@ public struct ConfigGenerator {
         chmod 0700 volumes/worker/cache
         rm -f volumes/bb/installed
 
+        """
+    }
+
+    /// Removes the FUSE mount a stopped bb_worker leaves on its build directory.
+    ///
+    /// bb_worker mounts it inside its container, and the shared bind propagates the
+    /// mount to the host. bb_worker exits on SIGTERM without unmounting, so the host keeps
+    /// a dead mount ("Transport endpoint is not connected") that breaks `mkdir` and the
+    /// next worker. It belongs to root; when the deploy runs without sudo, a privileged
+    /// container that shares the directory unmounts it, and the unmount propagates back.
+    static func unmountWorkerBuildDirectory(helperImage: String) -> String {
+        """
+        BUILD_DIR="$(pwd -P)/volumes/worker/build"
+        bbm_build_mounted() { awk -v p="$BUILD_DIR" '$5 == p { found = 1 } END { exit !found }' /proc/self/mountinfo 2>/dev/null; }
+        if bbm_build_mounted; then
+          echo "Unmounting the build directory left mounted by the stopped worker"
+          umount "$BUILD_DIR" 2>/dev/null || umount -l "$BUILD_DIR" 2>/dev/null || true
+        fi
+        if bbm_build_mounted; then
+          docker run --rm --privileged --network none --entrypoint umount -v "$(pwd -P)/volumes/worker:/worker:rshared" \(Shell.quote(helperImage)) -l /worker/build || true
+        fi
+        if bbm_build_mounted; then
+          echo "error: $BUILD_DIR is still mounted by a stopped worker. Unmount it with: sudo umount -l '$BUILD_DIR'"
+          exit 1
+        fi
         """
     }
 

@@ -747,6 +747,26 @@ import Testing
         try StateStore(url: URL(fileURLWithPath: path)).save(PersistedState(machines: machines, cluster: cluster))
     }
 
+    /// bb_worker leaves its FUSE mount behind when it stops, and without sudo only a
+    /// privileged container can remove it. It must go before the directories are created.
+    @Test func fuseWorkerRemovesTheStaleBuildMount() throws {
+        let (cluster, machines) = Self.cluster(shards: 1, kind: .fuse)
+        let plan = try #require(ConfigGenerator(cluster: cluster, machines: machines).workerPlan(cluster.workers[0]))
+        let script = plan.prepareScript
+        #expect(script.contains("/proc/self/mountinfo"))
+        let helper = try #require(script.range(of: "--entrypoint umount"))
+        #expect(script.contains(":/worker:rshared\" \(Shell.quote(cluster.workers[0].settings.runnerImage)) -l /worker/build"))
+        let mkdir = try #require(script.range(of: "mkdir -p volumes/bb"))
+        #expect(helper.upperBound < mkdir.lowerBound)
+
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: "/bin/sh")
+        check.arguments = ["-n", "-c", script]
+        try check.run()
+        check.waitUntilExit()
+        #expect(check.terminationStatus == 0)
+    }
+
     /// Writes rendered configs to $BBM_RENDER_DIR for manual inspection or validation.
     @Test func renderToDirectoryIfRequested() throws {
         guard let dir = ProcessInfo.processInfo.environment["BBM_RENDER_DIR"] else { return }

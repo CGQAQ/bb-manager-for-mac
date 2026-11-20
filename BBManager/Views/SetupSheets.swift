@@ -189,9 +189,10 @@ struct AddWorkerSheet: View {
         }
         .onChange(of: machineID, initial: true) { _, id in
             guard let machine = model.machine(id) else { return }
-            if let cpus = machine.facts?.cpuCount, cpus > 0 {
-                settings.concurrency = cpus
-            }
+            // New workers join the shared pool with most of the machine's CPUs and keep
+            // the rest for actions that need their own platform.
+            let cpus = machine.facts?.cpuCount ?? 0
+            settings.splitSlots(total: cpus > 0 ? cpus : max(1, model.cluster.workerDefaults.concurrency))
             // New workers join the instance name the existing workers already serve.
             if let existing = model.cluster.workers.first?.settings.instanceNamePrefix {
                 settings.instanceNamePrefix = existing

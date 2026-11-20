@@ -380,6 +380,27 @@ public struct WorkerSettings: Codable, Hashable, Sendable {
         sharedPoolConcurrency > 0 ? "\(max(1, concurrency)) + \(sharedPoolConcurrency) shared" : "\(max(1, concurrency))"
     }
 
+    /// Of a worker's slots, the part it keeps for its own platform while in the shared
+    /// pool: a quarter, at least one. Most actions, such as compiles, go to the pool.
+    public static func ownSlots(ofTotal total: Int) -> Int { max(1, total / 4) }
+
+    /// Splits `total` slots between the worker's own platform and the shared pool,
+    /// so the two together never run more actions than `total`.
+    public mutating func splitSlots(total: Int) {
+        let total = max(2, total)
+        concurrency = Self.ownSlots(ofTotal: total)
+        sharedPoolSlots = total - concurrency
+    }
+
+    /// Joins the shared pool by moving most of the worker's slots into it.
+    public mutating func joinSharedPool() { splitSlots(total: totalSlots) }
+
+    /// Leaves the shared pool, giving its slots back to the worker's own platform.
+    public mutating func leaveSharedPool() {
+        concurrency = totalSlots
+        sharedPoolSlots = nil
+    }
+
     public static let recommendedRunnerImage =
         "ghcr.io/catthehacker/ubuntu:act-22.04@sha256:dd7654ffb01d5b7b54b23b9ce928a1f7f2d08c7b3d7e320b6574b55d7ccde78b"
 

@@ -899,3 +899,28 @@ import Testing
         #expect(Profile.uniqueName("Home", among: profiles) == "Home 3")
     }
 }
+
+@Suite struct SharedPoolSlotTests {
+    /// New workers join the shared pool with three quarters of their slots, never
+    /// running more actions in all than the machine has CPUs.
+    @Test func splitsSlotsBetweenOwnPlatformAndSharedPool() {
+        for (cpus, own, shared) in [(32, 8, 24), (16, 4, 12), (6, 1, 5), (1, 1, 1)] {
+            var settings = WorkerSettings()
+            settings.splitSlots(total: cpus)
+            #expect(settings.concurrency == own, "\(cpus) CPUs")
+            #expect(settings.sharedPoolConcurrency == shared, "\(cpus) CPUs")
+        }
+    }
+
+    @Test func joiningAndLeavingKeepTheTotal() {
+        var settings = WorkerSettings()
+        settings.concurrency = 32
+        settings.joinSharedPool()
+        #expect(settings.slotsDescription == "8 + 24 shared")
+        #expect(settings.totalSlots == 32)
+        settings.leaveSharedPool()
+        #expect(settings.concurrency == 32)
+        #expect(settings.sharedPoolSlots == nil)
+        #expect(settings.slotsDescription == "32")
+    }
+}

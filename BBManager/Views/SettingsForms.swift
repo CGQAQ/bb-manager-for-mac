@@ -168,6 +168,8 @@ struct WorkerNodeSettingsForm: View {
 struct WorkerSettingsSections: View {
     @Binding var settings: WorkerSettings
     var machine: Machine?
+    /// Editing the defaults for new workers, whose slots come from each machine's CPUs.
+    var isDefaults = false
 
     private var isNative: Bool { settings.kind.isNative }
 
@@ -180,8 +182,12 @@ struct WorkerSettingsSections: View {
                 Label("This machine has no /dev/fuse. Use a hardlinking worker or install FUSE.", systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
             }
-            IntegerField(title: "Concurrency", value: $settings.concurrency, unit: "actions", range: 1...512,
-                         help: machine?.facts?.cpuCount.map { "This machine has \($0) CPUs." } ?? "Number of actions run in parallel.")
+            if !isDefaults {
+                IntegerField(title: "Concurrency", value: $settings.concurrency, unit: "actions", range: 1...512,
+                             help: settings.sharedPoolConcurrency > 0
+                                ? "Actions for this worker's own platform. The shared pool has its own slots below."
+                                : machine?.facts?.cpuCount.map { "This machine has \($0) CPUs." } ?? "Number of actions run in parallel.")
+            }
             TextField("Instance Name Prefix", text: $settings.instanceNamePrefix, prompt: Text("empty: default instance"))
         } header: {
             Text("Execution")
@@ -215,25 +221,15 @@ struct WorkerSettingsSections: View {
                  : "Actions run inside the runner image. Bazel's exec properties must match the platform properties exactly; the Overview shows matching .bazelrc lines.")
         }
 
-        Section {
-            Toggle(isOn: Binding(
-                get: { settings.sharedPoolConcurrency > 0 },
-                set: { settings.sharedPoolSlots = $0 ? max(1, settings.concurrency) : nil }
-            )) {
-                Text("Join the Shared Pool")
-                Text("Also take actions whose platform is exactly \(Self.sharedPoolPlatform).")
+        if isDefaults {
+            Section {
+                Text("A new worker gets one slot per CPU of its machine. Three quarters go to the shared pool (\(Self.sharedPoolPlatform)), for actions that run on any worker whatever its OS; the rest stay with the worker's own platform. Change them in each worker's settings.")
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Slots and Shared Pool")
             }
-            if settings.sharedPoolConcurrency > 0 {
-                IntegerField(title: "Shared Pool Slots", value: Binding(
-                    get: { settings.sharedPoolConcurrency },
-                    set: { settings.sharedPoolSlots = $0 }
-                ), unit: "actions", range: 1...512,
-                help: "In addition to the worker's own slots, so a busy worker may run both at once.")
-            }
-        } header: {
-            Text("Shared Pool")
-        } footer: {
-            Text("The shared pool is for actions that run on any worker, whatever its OS, such as compiles through a wrapper that picks the worker's own compiler. The worker keeps its own platform for actions that need its OS.")
+        } else {
+            sharedPoolSection
         }
 
         Section("Caching") {
@@ -246,7 +242,33 @@ struct WorkerSettingsSections: View {
             }
             IntegerField(title: "Parallel Input Downloads", value: $settings.inputDownloadConcurrency, range: 1...256)
             IntegerField(title: "Parallel Output Uploads", value: $settings.outputUploadConcurrency, range: 1...256)
-            DiskEstimateRow(required: diskBytes, available: machine?.facts?.diskAvailableBytes)
+            if !isDefaults {
+                DiskEstimateRow(required: diskBytes, available: machine?.facts?.diskAvailableBytes)
+            }
+        }
+    }
+
+    private var sharedPoolSection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { settings.sharedPoolConcurrency > 0 },
+                set: { if $0 { settings.joinSharedPool() } else { settings.leaveSharedPool() } }
+            )) {
+                Text("Join the Shared Pool")
+                Text("Also take actions whose platform is exactly \(Self.sharedPoolPlatform).")
+            }
+            if settings.sharedPoolConcurrency > 0 {
+                IntegerField(title: "Shared Pool Slots", value: Binding(
+                    get: { settings.sharedPoolConcurrency },
+                    set: { settings.sharedPoolSlots = $0 }
+                ), unit: "actions", range: 1...512,
+                help: "Added to the worker's own slots: \(settings.totalSlots) in all"
+                    + (machine?.facts?.cpuCount.map { " on \($0) CPUs." } ?? "."))
+            }
+        } header: {
+            Text("Shared Pool")
+        } footer: {
+            Text("The shared pool is for actions that run on any worker, whatever its OS, such as compiles through a wrapper that picks the worker's own compiler. Joining moves three quarters of the worker's slots into it; the rest stay with its own platform for actions that need its OS, such as Bazel actions. Leaving gives them back.")
         }
     }
 

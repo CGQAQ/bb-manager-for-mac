@@ -166,7 +166,7 @@ struct NodesCard: View {
                 }
                 ForEach(model.cluster.workers) { worker in
                     Divider()
-                    row(.worker(worker.id), subtitle: "\(worker.settings.kind.shortLabel) · \(worker.settings.concurrency) slots")
+                    row(.worker(worker.id), subtitle: "\(worker.settings.kind.shortLabel) · \(worker.settings.slotsDescription) slots")
                 }
                 if model.cluster.workers.isEmpty {
                     Divider()
@@ -253,6 +253,11 @@ struct ChromiumCard: View {
                 Text("Point Siso in a Chromium checkout at this cluster. Its remote actions run on the Linux worker on \(setup.workerMachineName).")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                if model.cluster.workers.contains(where: { $0.settings.sharedPoolConcurrency > 0 }) {
+                    Text("Workers in the shared pool also take actions whose platform is exactly `\(setup.sharedPoolPlatform)`, whatever their OS. Send it only for actions that run anywhere, such as compiles through a wrapper that picks the worker's own compiler; stock Chromium runs the host's tools, so this setup keeps them on Linux.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 Snippet(path: ".gclient", note: "Add to the custom_vars of the \"src\" solution.", text: setup.gclientCustomVars)
                 Snippet(path: "src/build/config/siso/backend_config/backend.star", note: "Create this file. Buildbarn runs an action only on workers whose platform properties match it exactly.", text: setup.backendStar)
                 Snippet(path: "src/build/config/siso/.sisorc", note: "Create this file: the cluster has no TLS or authentication.", text: setup.sisorc)

@@ -639,6 +639,58 @@ import Testing
         #expect(rc.contains("--remote_default_exec_properties=OSFamily=linux"))
     }
 
+    /// Workers in the shared pool register it as a second runner next to their own platform.
+    @Test func workersJoinTheSharedPool() throws {
+        var (cluster, machines) = Self.cluster()
+        let mac = Machine(name: "mac", host: "10.0.0.3", user: "builder")
+        var macSettings = WorkerSettings()
+        macSettings.kind = .nativeNFSv4
+        macSettings.advertiseContainerImage = false
+        macSettings.platformProperties = [PlatformProperty(name: "OSFamily", value: "macos")]
+        macSettings.concurrency = 6
+        macSettings.sharedPoolSlots = 3
+        cluster.workers.append(WorkerNode(machineID: mac.id, settings: macSettings))
+        machines.append(mac)
+        var generator = ConfigGenerator(cluster: cluster, machines: machines)
+        #expect(generator.totalExecutorSlots == 4 + 6 + 3)
+
+        func workerConfig(_ index: Int) throws -> String {
+            let plan = try #require(generator.workerPlan(generator.cluster.workers[index]))
+            return try #require(plan.files.first { $0.path == "config/worker.jsonnet" }).content
+        }
+        // Not in the pool: one runner, as before.
+        #expect(try workerConfig(0).components(separatedBy: "endpoint:").count == 2)
+        #expect(try !workerConfig(0).contains("'generic'"))
+
+        let macConfig = try workerConfig(1)
+        #expect(macConfig.components(separatedBy: "endpoint: { address: 'unix:runner.sock' },").count == 3)
+        #expect(macConfig.contains("{ name: 'OSFamily', value: 'macos' },"))
+        #expect(macConfig.contains("concurrency: 6,"))
+        #expect(macConfig.contains("{ name: 'pool', value: 'generic' },"))
+        #expect(macConfig.contains("concurrency: 3,"))
+        #expect(macConfig.contains("pool: 'generic',"))
+        // The file pool covers the actions of both runners.
+        #expect(macConfig.contains("sizeBytes: \(ConfigGenerator.sizeExpression(9 * 1024 * 1024 * 1024)),"))
+
+        generator.cluster.workers[0].settings.sharedPoolSlots = 2
+        let fuseConfig = try workerConfig(0)
+        #expect(fuseConfig.components(separatedBy: "endpoint: { address: 'unix:///worker/runner' },").count == 3)
+        #expect(generator.cluster.workers[0].settings.slotsDescription == "4 + 2 shared")
+        #expect(generator.cluster.workers[1].settings.slotsDescription == "6 + 3 shared")
+    }
+
+    /// Settings saved before the shared pool existed still load, with the pool off.
+    @Test func decodesWorkerSettingsWithoutSharedPool() throws {
+        var settings = WorkerSettings()
+        settings.sharedPoolSlots = 5
+        var json = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)) as? [String: Any])
+        #expect(json["sharedPoolSlots"] as? Int == 5)
+        json.removeValue(forKey: "sharedPoolSlots")
+        let decoded = try JSONDecoder().decode(WorkerSettings.self, from: JSONSerialization.data(withJSONObject: json))
+        #expect(decoded.sharedPoolConcurrency == 0)
+        #expect(decoded.totalSlots == decoded.concurrency)
+    }
+
     @Test func chromiumSetupTargetsLinuxWorker() throws {
         var (cluster, machines) = Self.cluster()
         cluster.workers[0].settings.instanceNamePrefix = "team"

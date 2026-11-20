@@ -746,19 +746,50 @@ public struct ConfigGenerator {
         """
     }
 
-    func platformBlock(_ s: WorkerSettings) -> String {
-        let props = s.effectivePlatformProperties
+    func platformBlock(_ properties: [(name: String, value: String)]) -> String {
+        let props = properties
             .map { "{ name: \(js($0.name)), value: \(js($0.value)) }," }
             .joined(separator: "\n")
         return "platform: {\n  properties: [\n\(Self.indent(props, 4, includeFirstLine: true))\n  ],\n},"
     }
 
-    func workerID(_ machine: Machine) -> String {
-        "workerId: {\n  hostname: \(js(machine.host)),\n  node: \(js(machine.displayName)),\n},"
+    func workerID(_ machine: Machine, pool: String? = nil) -> String {
+        let poolLine = pool.map { "\n  pool: \(js($0))," } ?? ""
+        return "workerId: {\n  hostname: \(js(machine.host)),\n  node: \(js(machine.displayName)),\(poolLine)\n},"
+    }
+
+    /// The worker's runner entries: one for its own platform and, when it takes part in
+    /// the cluster's shared pool, one for that. Both send actions to the same bb_runner;
+    /// the scheduler gives each entry its own slots.
+    func runners(_ s: WorkerSettings, endpoint: String, machine: Machine, filePoolPerAction: Int64? = nil, note: String? = nil) -> String {
+        var entries: [(properties: [(name: String, value: String)], concurrency: Int, pool: String?, note: String?)] = [
+            (s.effectivePlatformProperties, max(1, s.concurrency), nil, note),
+        ]
+        if s.sharedPoolConcurrency > 0 {
+            entries.append((WorkerSettings.sharedPoolProperties, s.sharedPoolConcurrency,
+                            WorkerSettings.sharedPoolProperties.first?.value,
+                            "The cluster's shared pool: actions that run on any worker, whatever its OS."))
+        }
+        let blocks = entries.map { entry in
+            var lines: [String] = []
+            if let note = entry.note {
+                lines += note.split(separator: "\n").map { "// " + $0 }
+            }
+            lines.append("endpoint: { address: \(js(endpoint)) },")
+            lines.append("concurrency: \(entry.concurrency),")
+            lines.append("instanceNamePrefix: \(js(s.instanceNamePrefix)),")
+            lines.append(platformBlock(entry.properties))
+            if let perAction = filePoolPerAction {
+                lines.append("maximumFilePoolFileCount: 100000,")
+                lines.append("maximumFilePoolSizeBytes: \(Self.sizeExpression(perAction)),")
+            }
+            lines.append(workerID(machine, pool: entry.pool))
+            return "{\n" + Self.indent(lines.joined(separator: "\n"), 2, includeFirstLine: true) + "\n},"
+        }
+        return "runners: [\n" + Self.indent(blocks.joined(separator: "\n"), 2, includeFirstLine: true) + "\n],"
     }
 
     func fuseWorker(_ s: WorkerSettings, main: MainNodeSettings, machine: Machine) -> String {
-        let concurrency = max(1, s.concurrency)
         let cacheBytes = Self.bytes(gib: max(1, s.localCacheSizeGiB))
         let perAction = Self.bytes(gib: max(0.125, s.filePoolPerActionGiB))
         let localCache = Self.localBlobstore(
@@ -821,21 +852,13 @@ public struct ConfigGenerator {
                 },
               },
             },
-            runners: [{
-              endpoint: { address: 'unix:///worker/runner' },
-              concurrency: \(concurrency),
-              instanceNamePrefix: \(js(s.instanceNamePrefix)),
-        \(Self.indent(platformBlock(s), 6, includeFirstLine: true))
-              maximumFilePoolFileCount: 100000,
-              maximumFilePoolSizeBytes: \(Self.sizeExpression(perAction)),
-        \(Self.indent(workerID(machine), 6, includeFirstLine: true))
-            }],
+        \(Self.indent(runners(s, endpoint: "unix:///worker/runner", machine: machine, filePoolPerAction: perAction), 4, includeFirstLine: true))
           }],
           filePool: {
             blockDevice: {
               file: {
                 path: '/worker/filepool',
-                sizeBytes: \(Self.sizeExpression(perAction * Int64(concurrency))),
+                sizeBytes: \(Self.sizeExpression(perAction * Int64(s.totalSlots))),
               },
             },
           },
@@ -884,13 +907,7 @@ public struct ConfigGenerator {
               maximumCacheSizeBytes: \(Self.sizeExpression(cacheBytes)),
               cacheReplacementPolicy: 'LEAST_RECENTLY_USED',
             },
-            runners: [{
-              endpoint: { address: 'unix:///worker/runner' },
-              concurrency: \(max(1, s.concurrency)),
-              instanceNamePrefix: \(js(s.instanceNamePrefix)),
-        \(Self.indent(platformBlock(s), 6, includeFirstLine: true))
-        \(Self.indent(workerID(machine), 6, includeFirstLine: true))
-            }],
+        \(Self.indent(runners(s, endpoint: "unix:///worker/runner", machine: machine), 4, includeFirstLine: true))
           }],
           inputDownloadConcurrency: \(max(1, s.inputDownloadConcurrency)),
           outputUploadConcurrency: \(max(1, s.outputUploadConcurrency)),
@@ -980,7 +997,6 @@ public struct ConfigGenerator {
     public static func nfsSocketPath(_ directory: String) -> String { directory + "/nfsv4.sock" }
 
     func nfsWorker(_ s: WorkerSettings, main: MainNodeSettings, machine: Machine, directory: String) -> String {
-        let concurrency = max(1, s.concurrency)
         let cacheBytes = Self.bytes(gib: max(1, s.localCacheSizeGiB))
         let perAction = Self.bytes(gib: max(0.125, s.filePoolPerActionGiB))
         let localCache = Self.localBlobstore(
@@ -1037,21 +1053,13 @@ public struct ConfigGenerator {
                 },
               },
             },
-            runners: [{
-              endpoint: { address: 'unix:runner.sock' },
-              concurrency: \(concurrency),
-              instanceNamePrefix: \(js(s.instanceNamePrefix)),
-        \(Self.indent(platformBlock(s), 6, includeFirstLine: true))
-              maximumFilePoolFileCount: 100000,
-              maximumFilePoolSizeBytes: \(Self.sizeExpression(perAction)),
-        \(Self.indent(workerID(machine), 6, includeFirstLine: true))
-            }],
+        \(Self.indent(runners(s, endpoint: "unix:runner.sock", machine: machine, filePoolPerAction: perAction, note: Self.runnerSocketNote), 4, includeFirstLine: true))
           }],
           filePool: {
             blockDevice: {
               file: {
                 path: \(js(directory + "/filepool")),
-                sizeBytes: \(Self.sizeExpression(perAction * Int64(concurrency))),
+                sizeBytes: \(Self.sizeExpression(perAction * Int64(s.totalSlots))),
               },
             },
           },
@@ -1100,15 +1108,7 @@ public struct ConfigGenerator {
               maximumCacheSizeBytes: \(Self.sizeExpression(cacheBytes)),
               cacheReplacementPolicy: 'LEAST_RECENTLY_USED',
             },
-            runners: [{
-              // Relative to the working directory both launchd agents share; macOS caps
-              // Unix socket paths at 104 bytes, which long install paths would exceed.
-              endpoint: { address: 'unix:runner.sock' },
-              concurrency: \(max(1, s.concurrency)),
-              instanceNamePrefix: \(js(s.instanceNamePrefix)),
-        \(Self.indent(platformBlock(s), 6, includeFirstLine: true))
-        \(Self.indent(workerID(machine), 6, includeFirstLine: true))
-            }],
+        \(Self.indent(runners(s, endpoint: "unix:runner.sock", machine: machine, note: Self.runnerSocketNote), 4, includeFirstLine: true))
           }],
           inputDownloadConcurrency: \(max(1, s.inputDownloadConcurrency)),
           outputUploadConcurrency: \(max(1, s.outputUploadConcurrency)),
@@ -1121,6 +1121,12 @@ public struct ConfigGenerator {
 
         """
     }
+
+    /// Why native workers reach bb_runner through a relative socket path.
+    static let runnerSocketNote = """
+    Relative to the working directory both launchd daemons share; macOS caps
+    Unix socket paths at 104 bytes, which long install paths would exceed.
+    """
 
     func nativeRunner(directory: String) -> String {
         """
@@ -1243,6 +1249,10 @@ public struct ConfigGenerator {
         public var argsGN: String
         /// Commands that apply the configuration and build.
         public var commands: String
+        /// The shared pool's platform, e.g. `pool=generic`.
+        public var sharedPoolPlatform: String {
+            WorkerSettings.sharedPoolProperties.map { "\($0.name)=\($0.value)" }.joined(separator: ",")
+        }
     }
 
     /// Chromium's Siso build sends its remote actions to Linux workers, so this needs
@@ -1327,7 +1337,7 @@ public struct ConfigGenerator {
     }
 
     public var totalExecutorSlots: Int {
-        cluster.workers.reduce(0) { $0 + max(1, $1.settings.concurrency) }
+        cluster.workers.reduce(0) { $0 + $1.settings.totalSlots }
     }
 
     // MARK: - Formatting helpers

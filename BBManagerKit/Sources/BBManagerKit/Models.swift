@@ -358,8 +358,27 @@ public struct WorkerSettings: Codable, Hashable, Sendable {
     public var filePoolPerActionGiB: Double = 1
     public var inputDownloadConcurrency: Int = 10
     public var outputUploadConcurrency: Int = 11
+    /// Slots the worker also offers in the cluster's shared pool (see `sharedPoolProperties`).
+    /// Nil or 0: the worker takes no part. Optional so that saved settings without it decode.
+    public var sharedPoolSlots: Int?
 
     public init() {}
+
+    /// Platform of the cluster's shared pool, for actions that any worker can run whatever
+    /// its OS, such as compiles through a wrapper that picks the worker's own compiler.
+    /// Workers register it next to their own platform, which states their real OS.
+    public static let sharedPoolProperties: [(name: String, value: String)] = [(name: "pool", value: "generic")]
+
+    /// Slots in the shared pool; 0 when the worker takes no part.
+    public var sharedPoolConcurrency: Int { max(0, sharedPoolSlots ?? 0) }
+
+    /// Slots the worker registers with the scheduler across its own platform and the shared pool.
+    public var totalSlots: Int { max(1, concurrency) + sharedPoolConcurrency }
+
+    /// "32" or, with shared pool slots, "32 + 16 shared".
+    public var slotsDescription: String {
+        sharedPoolConcurrency > 0 ? "\(max(1, concurrency)) + \(sharedPoolConcurrency) shared" : "\(max(1, concurrency))"
+    }
 
     public static let recommendedRunnerImage =
         "ghcr.io/catthehacker/ubuntu:act-22.04@sha256:dd7654ffb01d5b7b54b23b9ce928a1f7f2d08c7b3d7e320b6574b55d7ccde78b"

@@ -345,7 +345,7 @@ struct NodeStatsStrip: View {
             let summary = model.workerSummary(id)
             let process = model.metrics[MetricsKey(role: role, service: "worker")].map(ProcessSummary.init)
             return [
-                ("Concurrency", "\(worker.settings.concurrency)"),
+                ("Concurrency", worker.settings.slotsDescription),
                 ("Actions run", Format.number(summary?.actionsExecuted)),
                 ("Worker memory", Format.bytes(process?.residentMemoryBytes)),
                 ("Uptime", process?.startTime.map { Format.duration(Date().timeIntervalSince($0)) } ?? "—"),

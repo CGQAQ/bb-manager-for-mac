@@ -199,7 +199,7 @@ struct AddWorkerSheet: View {
             if machine.facts?.isMacOS == true {
                 settings.kind = .nativeNFSv4
                 settings.advertiseContainerImage = false
-                settings.platformProperties = [PlatformProperty(name: "OSFamily", value: "darwin")]
+                settings.platformProperties = [PlatformProperty(name: "OSFamily", value: "macos")]
             } else {
                 settings.platformProperties = model.cluster.workerDefaults.platformProperties
                 settings.advertiseContainerImage = model.cluster.workerDefaults.advertiseContainerImage

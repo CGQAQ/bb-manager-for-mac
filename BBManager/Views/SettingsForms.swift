@@ -215,6 +215,27 @@ struct WorkerSettingsSections: View {
                  : "Actions run inside the runner image. Bazel's exec properties must match the platform properties exactly; the Overview shows matching .bazelrc lines.")
         }
 
+        Section {
+            Toggle(isOn: Binding(
+                get: { settings.sharedPoolConcurrency > 0 },
+                set: { settings.sharedPoolSlots = $0 ? max(1, settings.concurrency) : nil }
+            )) {
+                Text("Join the Shared Pool")
+                Text("Also take actions whose platform is exactly \(Self.sharedPoolPlatform).")
+            }
+            if settings.sharedPoolConcurrency > 0 {
+                IntegerField(title: "Shared Pool Slots", value: Binding(
+                    get: { settings.sharedPoolConcurrency },
+                    set: { settings.sharedPoolSlots = $0 }
+                ), unit: "actions", range: 1...512,
+                help: "In addition to the worker's own slots, so a busy worker may run both at once.")
+            }
+        } header: {
+            Text("Shared Pool")
+        } footer: {
+            Text("The shared pool is for actions that run on any worker, whatever its OS, such as compiles through a wrapper that picks the worker's own compiler. The worker keeps its own platform for actions that need its OS.")
+        }
+
         Section("Caching") {
             NumberField(title: settings.kind.isVirtual ? "Local Blob Cache" : "Local File Cache", value: $settings.localCacheSizeGiB, unit: "GiB", range: 1...4096, step: 4)
             if !settings.kind.isVirtual {
@@ -229,10 +250,12 @@ struct WorkerSettingsSections: View {
         }
     }
 
+    static let sharedPoolPlatform = WorkerSettings.sharedPoolProperties.map { "\($0.name)=\($0.value)" }.joined(separator: ",")
+
     private var diskBytes: Int64 {
         var gib = settings.localCacheSizeGiB * 1.0125
         if settings.kind.isVirtual {
-            gib += settings.filePoolPerActionGiB * Double(max(1, settings.concurrency))
+            gib += settings.filePoolPerActionGiB * Double(settings.totalSlots)
         }
         return Int64(gib * 1024 * 1024 * 1024)
     }

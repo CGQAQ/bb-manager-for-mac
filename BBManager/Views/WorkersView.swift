@@ -7,7 +7,7 @@ struct WorkerRow: Identifiable {
     var host: String
     var health: NodeHealth
     var kind: String
-    var concurrency: Int
+    var concurrency: String
     var actions: String
     var cpu: String
     var deployed: String
@@ -65,7 +65,7 @@ struct WorkersView: View {
                 host: machine?.host ?? "",
                 health: model.health(role),
                 kind: worker.settings.kind.shortLabel,
-                concurrency: worker.settings.concurrency,
+                concurrency: worker.settings.slotsDescription,
                 actions: Format.number(model.workerSummary(worker.id)?.actionsExecuted),
                 cpu: Format.percent(sample?.cpuUsage),
                 deployed: worker.deployedAt?.relativeDescription ?? "Never",
@@ -97,7 +97,7 @@ struct WorkersView: View {
             TableColumn("Build Directory", value: \.kind)
                 .width(min: 80, ideal: 100)
             TableColumn("Concurrency") { row in
-                Text("\(row.concurrency)").monospacedDigit()
+                Text(row.concurrency).monospacedDigit()
             }
             .width(min: 70, ideal: 90)
             TableColumn("Actions Run") { row in

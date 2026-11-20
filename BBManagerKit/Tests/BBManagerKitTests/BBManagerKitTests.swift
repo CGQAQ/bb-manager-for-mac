@@ -615,6 +615,22 @@ import Testing
         #expect(storage.contains("path: '/storage-cs/key_location_map'"))
     }
 
+    @Test func defaultChunkMappingIndexHoldsAChromiumBuild() throws {
+        // A 4 MiB index dropped chunk mappings after about 32k entries, so
+        // Chromium builds failed reading outputs with "Record not found".
+        let (cluster, machines) = Self.cluster()
+        let plan = try #require(ConfigGenerator(cluster: cluster, machines: machines).mainPlan())
+        let storage = try #require(plan.files.first { $0.path == "config/storage.jsonnet" }).content
+        let path = try #require(storage.range(of: "path: '/storage-cms/key_location_map',"))
+        let size = try #require(storage.range(of: "sizeBytes: ", range: path.upperBound..<storage.endIndex))
+        let end = try #require(storage.range(of: ",", range: size.upperBound..<storage.endIndex))
+        let bytes = storage[size.upperBound..<end.lowerBound]
+            .split(separator: "*")
+            .compactMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
+            .reduce(1, *)
+        #expect(bytes >= 64 * 1024 * 1024)
+    }
+
     @Test func workerPlanUsesAdvertisedAddress() throws {
         let (cluster, machines) = Self.cluster()
         let generator = ConfigGenerator(cluster: cluster, machines: machines)

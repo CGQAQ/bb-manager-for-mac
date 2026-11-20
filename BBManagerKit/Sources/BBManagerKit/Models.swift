@@ -227,7 +227,9 @@ public struct StorageSettings: Codable, Hashable, Sendable {
     /// Size of the chunk store (CAS) per shard.
     public var casSizeGiB: Double = 32
     public var actionCacheSizeMiB: Double = 256
-    public var chunkMappingSizeMiB: Double = 64
+    /// Its key-location map gets a twentieth of this. At 64 MiB the 4 MiB
+    /// map overflowed during a Chromium build and lost chunk mappings.
+    public var chunkMappingSizeMiB: Double = 2048
     public var fileSystemAccessCacheSizeMiB: Double = 64
     /// Keep data across restarts.
     public var persistent: Bool = true
